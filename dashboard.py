@@ -17,10 +17,11 @@ with st.sidebar:
     st.markdown("### Welcome, Ryan Horne")
     st.markdown("Automated Trading System Control Panel")
     st.divider()
-    
-    st.header("Alpaca Credentials")
-   pi_key = st.secrets["alpaca"]["api_key"]
+
+# Fetch credentials from Streamlit Secrets
+api_key = st.secrets["alpaca"]["api_key"]
 secret_key = st.secrets["alpaca"]["secret_key"]
+
 # Portfolio Metrics & Positions
 if api_key and secret_key:
     try:
@@ -57,7 +58,7 @@ if api_key and secret_key:
     except Exception as e:
         st.error(f"Failed to connect to Alpaca: {e}")
 else:
-    st.info("Please enter your Alpaca API Key and Secret Key in the sidebar to load account metrics.")
+    st.info("Please set up your Alpaca API Key and Secret Key in Streamlit Secrets.")
 
 st.divider()
 
