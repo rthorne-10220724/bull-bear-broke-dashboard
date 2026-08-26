@@ -515,47 +515,30 @@ def fetch_market_bars(ticker: str):
 # =====================================================================
 # 7. UNIFIED MAIN EXECUTION LOOP
 # =====================================================================
-if __name__ == "__main__":
-    print(f"[ENGINE V5 STARTED] Universe: {ALL_TICKERS}")
+import time
+from datetime import datetime
+
+def run_trading_cycle():
+    print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Starting Market Execution Cycle...")
     
-    # 1. Immediate OpenAI API Connection Test
+    # Kicks off your CrewAI agents & trading pipeline
     try:
-        test_res = openai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": "Ping test"}]
-        )
-        print("[CHECK PASSED] OpenAI API Key Connection: OK")
+        report = generate_intelligence_report()
+        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Intelligence report generated successfully.")
     except Exception as e:
-        print(f"[CHECK FAILED] OpenAI API Error: {e}")
-
-    # 2. Force CrewAI Email Report to trigger immediately on launch
-    print("[CREWAI] Triggering test report background thread...")
-    generate_and_send_crewai_report_async()
-
-    report_sent_today = True
-
-    # Main continuous market scanning loop follows
-    while True:
-        now_est = datetime.datetime.now(EASTERN_TZ)
+        print(f"[ERROR] Agent execution failed: {e}")
         
-        if now_est.hour == 0 and now_est.minute == 0:
-            report_sent_today = False
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Cycle complete.")
 
-        if now_est.hour == 12 and now_est.minute == 0 and not report_sent_today:
-            generate_and_send_crewai_report_async()
-            report_sent_today = True
-
-        if now_est.hour == 15 and now_est.minute == 55:
-            force_close_intraday_positions()
-            time.sleep(60)
-            continue
-
-        for ticker in ALL_TICKERS:
-            try:
-                df_1m, df_4h = fetch_market_bars(ticker)
-                if df_1m is not None and df_4h is not None:
-                    process_pipeline(ticker, df_1m, df_4h)
-            except Exception as e:
-                print(f"[LOOP ERROR] Failed processing {ticker}: {e}")
-
-        time.sleep(30)
+if __name__ == "__main__":
+    print("[ENGINE V5] Continuous Local Trading Loop Active.")
+    
+    while True:
+        try:
+            run_trading_cycle()
+        except Exception as e:
+            print(f"[ERROR] Unexpected cycle failure: {e}")
+        
+        # Pause for 15 minutes (900 seconds) between market scans
+        print("Sleeping for 15 minutes until next market scan...")
+        time.sleep(900)
