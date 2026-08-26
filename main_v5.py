@@ -4,6 +4,7 @@ import sqlite3
 import smtplib
 import datetime
 import requests
+import logging
 import threading
 from pathlib import Path
 from collections import deque
@@ -30,6 +31,9 @@ from crewai.tools import tool
 
 # Disable OpenTelemetry background warning logs
 os.environ["OTEL_SDK_DISABLED"] = "true"
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 # Safe environment variable loader for Render Linux vs Local Windows
 if os.path.exists(r"C:\MarketAgents\.env"):
@@ -136,8 +140,11 @@ def fetch_sec_executive_trades(ticker_symbol: str) -> str:
 
 market_data_collector = Agent(
     role="Market Data Collector",
-    goal="Gather comprehensive raw market data, market cap figures, insider filings, and momentum drivers.",
-    backstory="You are an expert financial researcher pulling raw stock and crypto metrics without hitting step limits.",
+    goal="Gather raw stock and crypto metrics, market cap figures, insider filings, and momentum drivers.",
+    backstory=(
+        "An expert financial data researcher focused on pulling precise technical "
+        "and market metrics without hitting iteration limits."
+    ),
     tools=[fetch_market_data, fetch_sec_executive_trades],
     max_iter=50,
     human_input=False,
@@ -147,8 +154,11 @@ market_data_collector = Agent(
 
 portfolio_risk_analyst = Agent(
     role="Portfolio Risk Analyst",
-    goal="Synthesize research into a highly structured, diverse multi-asset HTML investment digest.",
-    backstory="You are an expert risk strategist specializing in equity tiering, crypto risk levels, and insider reporting.",
+    goal="Evaluate technical setups and generate structured market intelligence reports.",
+    backstory=(
+        "A seasoned quantitative risk analyst that evaluates trading setups and constructs "
+        "portfolio risk digests."
+    ),
     tools=[],
     max_iter=35,
     human_input=False,
@@ -175,7 +185,7 @@ report_generation_task = Task(
 )
 
 def _run_crewai_report_task():
-    print("\n[CREWAI THREAD] Running daily intelligence report generation...")
+    logging.info("[CREWAI THREAD] Running daily intelligence report generation...")
     crew = Crew(
         agents=[market_data_collector, portfolio_risk_analyst],
         tasks=[data_collection_task, report_generation_task],
@@ -188,7 +198,7 @@ def _run_crewai_report_task():
         report_text = result.raw if hasattr(result, 'raw') else str(result)
         send_daily_email(report_text)
     except Exception as e:
-        print(f"[REPORT ERROR] CrewAI generation failed: {e}")
+        logging.error(f"[REPORT ERROR] CrewAI generation failed: {e}")
 
 def generate_and_send_crewai_report_async():
     report_thread = threading.Thread(target=_run_crewai_report_task, daemon=True)
@@ -200,7 +210,7 @@ def send_daily_email(html_summary: str):
     recipient = (os.getenv("RECIPIENT_EMAIL") or "").strip()
 
     if not all([sender_email, app_password, recipient]):
-        print("[EMAIL ERROR] Missing email credentials.")
+        logging.error("[EMAIL ERROR] Missing email credentials.")
         return
 
     clean_content = str(html_summary).replace('\xa0', ' ')
@@ -217,9 +227,9 @@ def send_daily_email(html_summary: str):
         with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
             server.login(sender_email, app_password)
             server.send_message(msg)
-            print("\nFormatted HTML email report successfully delivered!")
+            logging.info("Formatted HTML email report successfully delivered!")
     except Exception as e:
-        print(f"\n[EMAIL ERROR] Failed to send email: {e}")
+        logging.error(f"[EMAIL ERROR] Failed to send email: {e}")
 
 # =====================================================================
 # 3. DATABASE & AUDIT LOGGERS
@@ -254,7 +264,7 @@ init_db()
 def log_diagnostic(ticker: str, stage: str, detail: str):
     timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat()
     if DEBUG_VERBOSE:
-        print(f"    [DIAG] {ticker} | {stage} | {detail}")
+        logging.info(f"[DIAG] {ticker} | {stage} | {detail}")
     try:
         with sqlite3.connect(DB_FILE) as conn:
             conn.execute(
@@ -263,7 +273,7 @@ def log_diagnostic(ticker: str, stage: str, detail: str):
             )
             conn.commit()
     except Exception as e:
-        print(f"[DIAG-LOG ERROR] Could not write diagnostic row: {e}")
+        logging.error(f"[DIAG-LOG ERROR] Could not write diagnostic row: {e}")
 
 def log_decision(timestamp, ticker, asset_class, d, executed: int):
     with sqlite3.connect(DB_FILE) as conn:
@@ -327,7 +337,7 @@ class TechnicalGatekeeper:
         breakout_threshold = recent_high * 0.999 
         is_breakout = bool(current_price >= breakout_threshold)
 
-        # N-of-4 Scoring Gatekeeper (3 out of 4 required)
+        # N-of-4 Scoring Gatekeeper
         conditions_passed = sum([macro_uptrend, above_vwap, rvol_passed, is_breakout])
         passed_filter = bool(conditions_passed >= 3)
 
@@ -362,7 +372,7 @@ class TechnicalGatekeeper:
             account = trading_client.get_account()
             equity = float(account.equity)
         except Exception as e:
-            print(f"[ERROR] Could not fetch Alpaca equity: {e}")
+            logging.error(f"[ERROR] Could not fetch Alpaca equity: {e}")
             equity = 1000.0
 
         risk_per_share = abs(entry_price - stop_loss_price)
@@ -381,9 +391,9 @@ class TradeDecisionSchema(BaseModel):
     bearish_thesis: str = Field(description="3 concrete market structural failure risks")
     confidence_score: float = Field(description="Score between 0.0 and 1.0 evaluating thesis strength")
 
-def run_llm_strategy_agent(ticker: str, metrics: dict) -> Optional[TradeDecisionSchema]:
+def run_llm_strategy_agent(ticker: str, metrics: dict, bypass_cache: bool = False) -> Optional[TradeDecisionSchema]:
     now = time.time()
-    if ticker in DECISION_CACHE:
+    if not bypass_cache and ticker in DECISION_CACHE:
         cached_decision, cached_time = DECISION_CACHE[ticker]
         if now - cached_time < LLM_COOLDOWN_SECONDS:
             log_diagnostic(ticker, "LLM_CACHE_HIT",
@@ -420,7 +430,7 @@ def run_llm_strategy_agent(ticker: str, metrics: dict) -> Optional[TradeDecision
         return decision
     except Exception as e:
         log_diagnostic(ticker, "LLM_ERROR", str(e))
-        print(f"[ERROR] LLM Query Failed for {ticker}: {e}")
+        logging.error(f"[ERROR] LLM Query Failed for {ticker}: {e}")
         return None
 
 # =====================================================================
@@ -438,12 +448,54 @@ def execute_alpaca_order(ticker: str, qty: float, price: float, stop_loss: float
             stop_loss=StopLossRequest(stop_price=stop_loss)
         )
         order = trading_client.submit_order(order_data)
-        print(f"[ALPACA BRACKET ORDER SUBMITTED] {qty} shares of {ticker} | SL: ${stop_loss} | TP: ${take_profit} | Order ID: {order.id}")
+        logging.info(f"🚀 [EXECUTION TRIGGERED] {qty} shares of {ticker} | SL: ${stop_loss} | TP: ${take_profit} | Order ID: {order.id}")
         return str(order.id)
     except Exception as e:
         log_diagnostic(ticker, "ORDER_ERROR", str(e))
-        print(f"[ERROR] Alpaca Order Execution Failed: {e}")
+        logging.error(f"[ERROR] Alpaca Order Execution Failed: {e}")
         return None
+
+def evaluate_and_process_ticker(ticker: str, metrics: dict):
+    """
+    Evaluates ticker technical score and determines whether to buy automatically
+    or run through the LLM Adversary gate.
+    """
+    score = metrics.get("score", 0)
+    timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    
+    # Calculate position size
+    qty = TechnicalGatekeeper.calculate_position_size(metrics['current_price'], metrics['stop_loss'])
+    if qty <= 0:
+        log_diagnostic(ticker, "SKIP", "qty computed as 0 (risk_per_share was 0 or equity fetch failed)")
+        return
+
+    # PATH A: AUTO-EXECUTE HIGH TECHNICAL SETUPS (Score 3/4 or 4/4)
+    if score >= 3:
+        logging.info(f"🚀 [{ticker}] High Technical Setup Triggered ({score}/4)! Bypassing LLM Adversary...")
+        order_id = execute_alpaca_order(ticker, qty, metrics['current_price'], metrics['stop_loss'], metrics['take_profit'])
+        if order_id:
+            log_execution(timestamp, ticker, "BUY", qty, metrics['current_price'], metrics['stop_loss'], metrics['take_profit'], order_id)
+        return
+
+    # PATH B: AMBIGUOUS SETUPS (Score < 3) - RUN LLM ADVERSARY
+    logging.info(f"[{ticker}] Technical score {score}/4 below auto-buy threshold. Running LLM Adversary...")
+    decision = run_llm_strategy_agent(ticker, metrics, bypass_cache=True)
+    
+    if not decision:
+        log_diagnostic(ticker, "SKIP", "LLM returned no decision")
+        return
+
+    executed = 0
+    if decision.action == "BUY" and decision.confidence_score >= 0.50:
+        logging.info(f"[{ticker}] LLM Approved ({decision.action} @ {decision.confidence_score} confidence)")
+        order_id = execute_alpaca_order(ticker, qty, metrics['current_price'], metrics['stop_loss'], metrics['take_profit'])
+        if order_id:
+            executed = 1
+            log_execution(timestamp, ticker, "BUY", qty, metrics['current_price'], metrics['stop_loss'], metrics['take_profit'], order_id)
+    else:
+        logging.info(f"[DIAG] {ticker} | SKIP | LLM did not clear bar: action={decision.action} confidence={decision.confidence_score}")
+
+    log_decision(timestamp, ticker, metrics['asset_class'], decision, executed)
 
 def process_pipeline(ticker: str, df_1m: pd.DataFrame, df_4h: pd.DataFrame):
     current_time_est = datetime.datetime.now(EASTERN_TZ).time()
@@ -458,34 +510,9 @@ def process_pipeline(ticker: str, df_1m: pd.DataFrame, df_4h: pd.DataFrame):
         return
 
     metrics = TechnicalGatekeeper.calculate_indicators(ticker, df_1m, df_4h)
-    if not metrics['passed']:
-        return
-
     PROCESSED_BARS.append(bar_id)
-    timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat()
-    print(f"[{ticker}] {metrics['asset_class']} Technical Setup Triggered ({metrics['score']}/4)! Running LLM Adversary...")
-
-    decision = run_llm_strategy_agent(ticker, metrics)
-    if not decision:
-        log_diagnostic(ticker, "SKIP", "LLM returned no decision (see LLM_ERROR above)")
-        return
-
-    executed = 0
-    if decision.action == "BUY" and decision.confidence_score >= 0.50:
-        qty = TechnicalGatekeeper.calculate_position_size(metrics['current_price'], metrics['stop_loss'])
-        log_diagnostic(ticker, "SIZING", f"qty={qty} entry={metrics['current_price']} stop={metrics['stop_loss']}")
-        if qty > 0:
-            order_id = execute_alpaca_order(ticker, qty, metrics['current_price'], metrics['stop_loss'], metrics['take_profit'])
-            if order_id:
-                executed = 1
-                log_execution(timestamp, ticker, "BUY", qty, metrics['current_price'], metrics['stop_loss'], metrics['take_profit'], order_id)
-        else:
-            log_diagnostic(ticker, "SKIP", "qty computed as 0 (risk_per_share was 0 or equity fetch failed)")
-    else:
-        log_diagnostic(ticker, "SKIP",
-                        f"LLM did not clear bar: action={decision.action} confidence={decision.confidence_score}")
-
-    log_decision(timestamp, ticker, metrics['asset_class'], decision, executed)
+    
+    evaluate_and_process_ticker(ticker, metrics)
 
 def fetch_market_bars(ticker: str):
     now = datetime.datetime.now(datetime.timezone.utc)
@@ -522,13 +549,13 @@ def fetch_market_bars(ticker: str):
 # =====================================================================
 def run_trading_cycle():
     now_est = datetime.datetime.now(EASTERN_TZ)
-    print(f"\n[{now_est.strftime('%Y-%m-%d %H:%M:%S')}] Starting Market Execution Cycle...")
+    logging.info(f"Starting Market Execution Cycle [{now_est.strftime('%Y-%m-%d %H:%M:%S EST')}]...")
 
     if now_est.hour == 12 and now_est.minute < 3:
         try:
             generate_and_send_crewai_report_async()
         except Exception as e:
-            print(f"[ERROR] CrewAI report task failed: {e}")
+            logging.error(f"[ERROR] CrewAI report task failed: {e}")
 
     for ticker in ALL_TICKERS:
         try:
@@ -537,17 +564,17 @@ def run_trading_cycle():
                 process_pipeline(ticker, bars_1m, df_4h)
         except Exception as e:
             log_diagnostic(ticker, "FETCH_ERROR", f"{type(e).__name__}: {e}")
-            print(f"[ERROR] Failed processing ticker {ticker}: {e}")
+            logging.error(f"[ERROR] Failed processing ticker {ticker}: {e}")
 
-    print(f"[{now_est.strftime('%Y-%m-%d %H:%M:%S')}] Cycle complete.")
+    logging.info(f"Cycle complete [{now_est.strftime('%Y-%m-%d %H:%M:%S EST')}].")
 
 if __name__ == "__main__":
-    print("[ENGINE V5] Continuous Local Trading Loop Active. (diagnostic build)")
+    logging.info("[ENGINE V5] Continuous Local Trading Loop Active. (diagnostic build)")
     while True:
         try:
             run_trading_cycle()
         except Exception as e:
-            print(f"[ERROR] Unexpected cycle failure: {e}")
+            logging.error(f"[ERROR] Unexpected cycle failure: {e}")
 
-        print("Sleeping 3 minutes until next market scan...")
+        logging.info("Sleeping 3 minutes until next market scan...")
         time.sleep(180)
