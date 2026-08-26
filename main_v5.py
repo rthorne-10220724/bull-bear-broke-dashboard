@@ -17,6 +17,7 @@ from typing import Literal, Optional
 from pydantic import BaseModel, Field
 from openai import OpenAI
 from crewai import Agent, Crew, Process, Task, LLM
+from crewai.tools import tool
 
 # Alpaca SDK Imports
 from alpaca.trading.client import TradingClient
@@ -51,7 +52,7 @@ trading_client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=PAPER_TR
 data_client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
 
 DB_FILE = "paper_trail_audit_v5.db"
-RISK_PER_TRADE_PCT = 0.05  # Raised to 5% equity risk for stronger position sizing
+RISK_PER_TRADE_PCT = 0.05  # 5% equity risk for stronger position sizing
 LLM_COOLDOWN_SECONDS = 900  # 15-minute cooldown per ticker for LLM API calls
 EASTERN_TZ = ZoneInfo("America/New_York")
 
@@ -70,7 +71,7 @@ SEC_CIK_MAP = {
     "COIN": "0001834488"
 }
 
-# Optimized Sensitivity Parameters for High Execution & Low Cost
+# Optimized Parameters for Maximum Execution Sensitivity & Low Cost
 RISK_PARAMS = {
     "STANDARD": {
         "min_rvol": 1.0,           # Baseline normal volume triggers technical check
@@ -92,7 +93,7 @@ PROCESSED_BARS = deque(maxlen=1000)
 DECISION_CACHE = {}
 
 # =====================================================================
-# 2. CREWAI AGENTS & EMAIL REPORTING SYSTEM
+# 2. CREWAI TOOLS, AGENTS & EMAIL REPORTING SYSTEM
 # =====================================================================
 openai_llm = LLM(
     model="gpt-4o-mini",
@@ -100,7 +101,9 @@ openai_llm = LLM(
     api_key=OPENAI_API_KEY
 )
 
+@tool("Fetch Market Data")
 def fetch_market_data(ticker_symbol: str) -> str:
+    """Fetches real-time price and market capitalization for a stock or crypto ticker."""
     try:
         ticker = yf.Ticker(ticker_symbol)
         info = ticker.fast_info
@@ -108,7 +111,9 @@ def fetch_market_data(ticker_symbol: str) -> str:
     except Exception as e:
         return f"Error fetching market data for {ticker_symbol}: {str(e)}"
 
+@tool("Fetch SEC Insider Activity")
 def fetch_sec_executive_trades(ticker_symbol: str) -> str:
+    """Retrieves recent Form 4 insider trading filings directly from SEC EDGAR."""
     cik = SEC_CIK_MAP.get(ticker_symbol.upper())
     if not cik:
         return f"No SEC CIK mapping configured for {ticker_symbol}."
@@ -127,43 +132,53 @@ def fetch_sec_executive_trades(ticker_symbol: str) -> str:
     except Exception as e:
         return f"Could not retrieve SEC EDGAR data for {ticker_symbol}: {str(e)}"
 
-scraper_agent = Agent(
-    role="Data Scraper Specialist",
-    goal="Extract quantitative market metrics, executive Form 4 filings, and crypto trends.",
-    backstory="You gather raw numbers, executive share disclosures, and market trends.",
+market_data_collector = Agent(
+    role="Market Data Collector",
+    goal="Gather comprehensive raw market data, market cap figures, insider filings, and momentum drivers.",
+    backstory="You are an expert financial researcher pulling raw stock and crypto metrics without hitting step limits.",
+    tools=[fetch_market_data, fetch_sec_executive_trades],
+    max_iter=50,
+    human_input=False,
     verbose=True,
     llm=openai_llm
 )
 
-analyst_agent = Agent(
+portfolio_risk_analyst = Agent(
     role="Portfolio Risk Analyst",
-    goal="Synthesize research into a highly structured, diverse multi-asset investment report.",
-    backstory="You are an expert market strategist who specializes in tiering risk profiles across distinct price categories.",
+    goal="Synthesize research into a highly structured, diverse multi-asset HTML investment digest.",
+    backstory="You are an expert risk strategist specializing in equity tiering, crypto risk levels, and insider reporting.",
+    tools=[],
+    max_iter=35,
+    human_input=False,
     verbose=True,
     llm=openai_llm
+)
+
+data_collection_task = Task(
+    description="Collect market cap data, recent executive Form 4 filings, and broader stock/crypto momentum drivers for active watchlists using tools.",
+    expected_output="A complete aggregated raw market data brief.",
+    agent=market_data_collector,
+)
+
+report_generation_task = Task(
+    description=(
+        "Generate a comprehensive daily investment intelligence report in clean HTML format.\n"
+        "Required Sections:\n"
+        "1. STOCKS PORTFOLIO (High/Medium/Low Risk across Cheap <$50, Medium $50-$200, High >$200)\n"
+        "2. CRYPTOCURRENCY PORTFOLIO (High/Medium/Low Risk across <$1, $1-$100, >$100)\n"
+        "3. INSIDER & EXECUTIVE ACTIVITY"
+    ),
+    expected_output="Valid HTML snippet with <h2>, <h3>, <ul>, <li>, and <strong> tags.",
+    agent=portfolio_risk_analyst,
 )
 
 def _run_crewai_report_task():
     print("\n[CREWAI THREAD] Running daily intelligence report generation...")
-    stld_data = fetch_market_data("STLD")
-    stld_sec = fetch_sec_executive_trades("STLD")
-    
-    task_scrape = Task(
-        description=f"Gather financial context:\n1. STLD Raw Market Data: {stld_data}\n2. Executive Insider Filings: {stld_sec}\n3. Research broader stock market and cryptocurrency momentum drivers.",
-        expected_output="Aggregated raw market data brief.",
-        agent=scraper_agent
-    )
-    
-    task_report = Task(
-        description="Generate a comprehensive 12:00 PM daily investment intelligence report in HTML format.",
-        expected_output="Final HTML-formatted 12:00 PM daily investment intelligence report.",
-        agent=analyst_agent
-    )
-    
     crew = Crew(
-        agents=[scraper_agent, analyst_agent],
-        tasks=[task_scrape, task_report],
-        process=Process.sequential
+        agents=[market_data_collector, portfolio_risk_analyst],
+        tasks=[data_collection_task, report_generation_task],
+        process=Process.sequential,
+        verbose=True
     )
     
     try:
@@ -205,7 +220,7 @@ def send_daily_email(html_summary: str):
         print(f"\n[EMAIL ERROR] Failed to send email: {e}")
 
 # =====================================================================
-# 3. TRADING ENGINE DATABASE & LOGGERS
+# 3. DATABASE & AUDIT LOGGERS
 # =====================================================================
 def init_db():
     with sqlite3.connect(DB_FILE) as conn:
@@ -247,7 +262,7 @@ def log_execution(timestamp, ticker, side, qty, price, stop_loss, take_profit, a
         conn.commit()
 
 # =====================================================================
-# 4. DETERMINISTIC GATEKEEPER & POSITION SIZER
+# 4. TECHNICAL GATEKEEPER & POSITION SIZER
 # =====================================================================
 class TechnicalGatekeeper:
     @staticmethod
@@ -278,8 +293,6 @@ class TechnicalGatekeeper:
         atr = tr.rolling(14).mean().iloc[-1]
         
         current_price = float(df_1m['close'].iloc[-1])
-        
-        # 3-Bar Breakout Check (faster momentum detection)
         recent_high = float(df_1m['high'].iloc[-4:-1].max())
         is_breakout = current_price >= recent_high
         
@@ -359,7 +372,7 @@ def run_llm_strategy_agent(ticker: str, metrics: dict) -> Optional[TradeDecision
         return None
 
 # =====================================================================
-# 6. EXECUTION PIPELINE & EOD LIQUIDATION
+# 6. EXECUTION PIPELINE & BROKER INTERACTIONS
 # =====================================================================
 def execute_alpaca_order(ticker: str, qty: float, price: float, stop_loss: float, take_profit: float) -> Optional[str]:
     try:
@@ -402,7 +415,6 @@ def process_pipeline(ticker: str, df_1m: pd.DataFrame, df_4h: pd.DataFrame):
         return
 
     executed = 0
-    # Lowered confidence threshold to 0.50 for active paper trading
     if decision.action == "BUY" and decision.confidence_score >= 0.50:
         qty = TechnicalGatekeeper.calculate_position_size(metrics['current_price'], metrics['stop_loss'])
         if qty > 0:
@@ -439,13 +451,13 @@ def fetch_market_bars(ticker: str):
     return bars_1m, df_4h
 
 # =====================================================================
-# 7. UNIFIED MAIN EXECUTION LOOP
+# 7. UNIFIED MAIN LOOP
 # =====================================================================
 def run_trading_cycle():
     now_est = datetime.datetime.now(EASTERN_TZ)
     print(f"\n[{now_est.strftime('%Y-%m-%d %H:%M:%S')}] Starting Market Execution Cycle...")
 
-    # Only fire CrewAI email report once per day at 12:00 PM EST (Saves API tokens)
+    # Only fire CrewAI email report once per day at 12:00 PM EST
     if now_est.hour == 12 and now_est.minute < 3:
         try:
             generate_and_send_crewai_report_async()
@@ -465,7 +477,6 @@ def run_trading_cycle():
 
 if __name__ == "__main__":
     print("[ENGINE V5] Continuous Local Trading Loop Active.")
-    
     while True:
         try:
             run_trading_cycle()
