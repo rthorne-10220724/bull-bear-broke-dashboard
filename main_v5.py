@@ -25,7 +25,7 @@ from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
-from alpaca.data.enums import DataFeed  # <-- NEW: needed to force the free-tier IEX feed
+from alpaca.data.enums import DataFeed
 from crewai.tools import tool
 
 # Disable OpenTelemetry background warning logs
@@ -45,9 +45,6 @@ ALPACA_API_KEY = os.getenv("ALPACA_API_KEY")
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
 PAPER_TRADING = True  # Set to False only when going live
 
-# NEW: master switch for the extra diagnostic prints added throughout this file.
-# Leave True until you've confirmed trades are executing again, then set to False
-# to quiet the console back down.
 DEBUG_VERBOSE = True
 
 if not all([OPENAI_API_KEY, ALPACA_API_KEY, ALPACA_SECRET_KEY]):
@@ -58,7 +55,7 @@ trading_client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=PAPER_TR
 data_client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
 
 DB_FILE = "paper_trail_audit_v5.db"
-RISK_PER_TRADE_PCT = 0.05  # 5% equity risk for stronger position sizing
+RISK_PER_TRADE_PCT = 0.05  # 5% equity risk
 LLM_COOLDOWN_SECONDS = 900  # 15-minute cooldown per ticker for LLM API calls
 EASTERN_TZ = ZoneInfo("America/New_York")
 
@@ -77,17 +74,16 @@ SEC_CIK_MAP = {
     "COIN": "0001834488"
 }
 
-# Optimized Parameters for Maximum Execution Sensitivity & Low Cost
 RISK_PARAMS = {
     "STANDARD": {
-        "min_rvol": 1.0,           # Baseline normal volume triggers technical check
+        "min_rvol": 1.0,
         "sl_atr_mult": 1.5,
         "rr_target": 2.5,
         "trailing_atr_mult": 2.0,
         "allow_overnight": False
     },
     "CRYPTO_ADJACENT": {
-        "min_rvol": 1.0,           # Baseline crypto volume
+        "min_rvol": 1.0,
         "sl_atr_mult": 2.0,
         "rr_target": 3.0,
         "trailing_atr_mult": 2.5,
@@ -245,8 +241,6 @@ def init_db():
                 stop_loss REAL, take_profit REAL, alpaca_order_id TEXT, status TEXT
             )
         ''')
-        # NEW: every pipeline pass gets logged here, whether or not it reached the LLM.
-        # This is the fastest way to see WHERE a ticker is getting stopped each cycle.
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS diagnostic_log (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -258,9 +252,6 @@ def init_db():
 init_db()
 
 def log_diagnostic(ticker: str, stage: str, detail: str):
-    """NEW: lightweight breadcrumb logger. Writes to both console and DB so you
-    can query `SELECT * FROM diagnostic_log ORDER BY id DESC LIMIT 50` later
-    instead of scrolling back through terminal output."""
     timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat()
     if DEBUG_VERBOSE:
         print(f"    [DIAG] {ticker} | {stage} | {detail}")
@@ -305,18 +296,24 @@ class TechnicalGatekeeper:
         asset_class = TechnicalGatekeeper.get_asset_class(ticker)
         params = RISK_PARAMS[asset_class]
 
+        # 1. Macro Uptrend Check
         df_4h['ema50'] = df_4h['close'].ewm(span=50, adjust=False).mean()
         macro_uptrend = bool(df_4h['close'].iloc[-1] > df_4h['ema50'].iloc[-1])
 
+        # 2. VWAP Check
         v = df_1m['volume']
         tp = (df_1m['high'] + df_1m['low'] + df_1m['close']) / 3
         vwap = (tp * v).cumsum() / (v.cumsum() + 1e-9)
         current_vwap = vwap.iloc[-1]
+        above_vwap = bool(df_1m['close'].iloc[-1] > current_vwap)
 
+        # 3. RVOL Check
         avg_volume = df_1m['volume'].tail(20).mean()
         current_volume = df_1m['volume'].iloc[-1]
         rvol = current_volume / avg_volume if avg_volume > 0 else 0.0
+        rvol_passed = bool(rvol >= params['min_rvol'])
 
+        # ATR & Price Calculations
         high_low = df_1m['high'] - df_1m['low']
         high_close = np.abs(df_1m['high'] - df_1m['close'].shift())
         low_close = np.abs(df_1m['low'] - df_1m['close'].shift())
@@ -325,26 +322,29 @@ class TechnicalGatekeeper:
 
         current_price = float(df_1m['close'].iloc[-1])
         recent_high = float(df_1m['high'].iloc[-4:-1].max())
-        is_breakout = current_price >= recent_high
+
+        # 4. Breakout Check with 0.1% Buffer
+        breakout_threshold = recent_high * 0.999 
+        is_breakout = bool(current_price >= breakout_threshold)
+
+        # N-of-4 Scoring Gatekeeper (3 out of 4 required)
+        conditions_passed = sum([macro_uptrend, above_vwap, rvol_passed, is_breakout])
+        passed_filter = bool(conditions_passed >= 3)
 
         stop_loss = round(current_price - (params['sl_atr_mult'] * atr), 2)
         take_profit = round(current_price + (params['sl_atr_mult'] * atr * params['rr_target']), 2)
 
-        passed_filter = bool(macro_uptrend and (current_price > current_vwap) and (rvol >= params['min_rvol']) and is_breakout)
-
-        # NEW: log every individual condition every cycle, not just when everything passes.
-        # This tells you WHICH gate is blocking a given ticker instead of just "no trade."
         log_diagnostic(
             ticker,
             "FILTER",
-            f"passed={passed_filter} | macro_uptrend={macro_uptrend} | "
-            f"price={round(current_price,2)} vwap={round(current_vwap,2)} above_vwap={current_price > current_vwap} | "
-            f"rvol={round(rvol,2)} (need>={params['min_rvol']}) | is_breakout={is_breakout} "
-            f"(price={round(current_price,2)} vs recent_high={round(recent_high,2)})"
+            f"score={conditions_passed}/4 | passed={passed_filter} | "
+            f"macro={macro_uptrend} | vwap={above_vwap} (P:{round(current_price,2)} vs V:{round(current_vwap,2)}) | "
+            f"rvol={rvol_passed} ({round(rvol,2)}x) | breakout={is_breakout} (P:{round(current_price,2)} vs Thresh:{round(breakout_threshold,2)})"
         )
 
         return {
             "passed": passed_filter,
+            "score": conditions_passed,
             "asset_class": asset_class,
             "current_price": round(current_price, 2),
             "vwap": round(current_vwap, 2),
@@ -396,6 +396,7 @@ def run_llm_strategy_agent(ticker: str, metrics: dict) -> Optional[TradeDecision
         f"Price: ${metrics['current_price']} | SL: ${metrics['stop_loss']} | TP: ${metrics['take_profit']}\n"
         f"RVOL: {metrics['rvol']}x (Req: {metrics['min_rvol_required']}x)\n"
         f"4H Trend: {'Strong Uptrend' if metrics['macro_uptrend'] else 'Downtrend'}\n"
+        f"Technical Score: {metrics['score']}/4 Conditions Passed\n"
         "Evaluate breakout failure probability. Output action (BUY/HOLD), 3 failure reasons, and confidence score."
     )
 
@@ -411,7 +412,6 @@ def run_llm_strategy_agent(ticker: str, metrics: dict) -> Optional[TradeDecision
         )
         decision = completion.choices[0].message.parsed
         DECISION_CACHE[ticker] = (decision, now)
-        # NEW: always log what the LLM actually said, pass or fail on confidence.
         log_diagnostic(
             ticker, "LLM_DECISION",
             f"action={decision.action} confidence={decision.confidence_score} "
@@ -419,8 +419,6 @@ def run_llm_strategy_agent(ticker: str, metrics: dict) -> Optional[TradeDecision
         )
         return decision
     except Exception as e:
-        # This used to just print - now it's also written to the DB so it survives
-        # a restart / isn't lost if you're not watching the console live.
         log_diagnostic(ticker, "LLM_ERROR", str(e))
         print(f"[ERROR] LLM Query Failed for {ticker}: {e}")
         return None
@@ -443,8 +441,6 @@ def execute_alpaca_order(ticker: str, qty: float, price: float, stop_loss: float
         print(f"[ALPACA BRACKET ORDER SUBMITTED] {qty} shares of {ticker} | SL: ${stop_loss} | TP: ${take_profit} | Order ID: {order.id}")
         return str(order.id)
     except Exception as e:
-        # NEW: this is a common silent-failure point (buying power, fractionability,
-        # market closed, bracket-order validation). Now it's captured in diagnostic_log too.
         log_diagnostic(ticker, "ORDER_ERROR", str(e))
         print(f"[ERROR] Alpaca Order Execution Failed: {e}")
         return None
@@ -463,12 +459,11 @@ def process_pipeline(ticker: str, df_1m: pd.DataFrame, df_4h: pd.DataFrame):
 
     metrics = TechnicalGatekeeper.calculate_indicators(ticker, df_1m, df_4h)
     if not metrics['passed']:
-        # (Detailed reason already logged inside calculate_indicators above.)
         return
 
     PROCESSED_BARS.append(bar_id)
     timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat()
-    print(f"[{ticker}] {metrics['asset_class']} Technical Breakout Triggered! Running LLM Adversary...")
+    print(f"[{ticker}] {metrics['asset_class']} Technical Setup Triggered ({metrics['score']}/4)! Running LLM Adversary...")
 
     decision = run_llm_strategy_agent(ticker, metrics)
     if not decision:
@@ -497,12 +492,6 @@ def fetch_market_bars(ticker: str):
     start_1m = now - datetime.timedelta(days=2)
     start_4h = now - datetime.timedelta(days=30)
 
-    # NEW: explicitly request the free-tier IEX feed. Without this, alpaca-py
-    # requests the "best available" feed, which on an account with no market
-    # data subscription means SIP -> a 403 on anything within the last ~15 min.
-    # That exception was previously only visible as a generic "[ERROR] Failed
-    # processing ticker" line in the outer loop, which silently killed the
-    # pipeline for that ticker every single cycle.
     request_1m = StockBarsRequest(
         symbol_or_symbols=ticker, timeframe=TimeFrame.Minute, start=start_1m, feed=DataFeed.IEX
     )
@@ -535,23 +524,18 @@ def run_trading_cycle():
     now_est = datetime.datetime.now(EASTERN_TZ)
     print(f"\n[{now_est.strftime('%Y-%m-%d %H:%M:%S')}] Starting Market Execution Cycle...")
 
-    # Only fire CrewAI email report once per day at 12:00 PM EST
     if now_est.hour == 12 and now_est.minute < 3:
         try:
             generate_and_send_crewai_report_async()
         except Exception as e:
             print(f"[ERROR] CrewAI report task failed: {e}")
 
-    # Process market universe
     for ticker in ALL_TICKERS:
         try:
             bars_1m, df_4h = fetch_market_bars(ticker)
             if bars_1m is not None and df_4h is not None:
                 process_pipeline(ticker, bars_1m, df_4h)
         except Exception as e:
-            # NEW: this used to be the dead end where SIP-permission errors (and
-            # anything else) disappeared. Now the full exception type + message
-            # is captured in diagnostic_log so you can query it after the fact.
             log_diagnostic(ticker, "FETCH_ERROR", f"{type(e).__name__}: {e}")
             print(f"[ERROR] Failed processing ticker {ticker}: {e}")
 
