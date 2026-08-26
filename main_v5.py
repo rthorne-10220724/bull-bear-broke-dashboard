@@ -71,19 +71,20 @@ SEC_CIK_MAP = {
     "COIN": "0001834488"
 }
 
+# NEW:
 RISK_PARAMS = {
     "STANDARD": {
-        "min_rvol": 1.8,
+        "min_rvol": 1.2,           # Lowered from 1.8 for earlier entries
         "sl_atr_mult": 1.5,
-        "rr_target": 3.0,
+        "rr_target": 2.5,
         "trailing_atr_mult": 2.0,
         "allow_overnight": False
     },
     "CRYPTO_ADJACENT": {
-        "min_rvol": 2.5,
-        "sl_atr_mult": 2.2,
-        "rr_target": 4.0,
-        "trailing_atr_mult": 3.0,
+        "min_rvol": 1.5,           # Lowered from 2.5
+        "sl_atr_mult": 2.0,
+        "rr_target": 3.0,
+        "trailing_atr_mult": 2.5,
         "allow_overnight": True
     }
 }
@@ -320,8 +321,8 @@ class TechnicalGatekeeper:
         atr = tr.rolling(14).mean().iloc[-1]
 
         current_price = float(df_1m['close'].iloc[-1])
-        recent_20_high = float(df_1m['high'].iloc[-21:-1].max())
-        is_breakout = current_price > recent_20_high
+       recent_5_high = float(df_1m['high'].iloc[-6:-1].max())
+        is_breakout = current_price > recent_5_high
 
         stop_loss = round(current_price - (params['sl_atr_mult'] * atr), 2)
         take_profit = round(current_price + (params['sl_atr_mult'] * atr * params['rr_target']), 2)
@@ -452,7 +453,7 @@ def process_pipeline(ticker: str, df_1m: pd.DataFrame, df_4h: pd.DataFrame):
         return
 
     executed = 0
-    if decision.action == "BUY" and decision.confidence_score >= 0.80:
+    if decision.action == "BUY" and decision.confidence_score >= 0.60:
         qty = TechnicalGatekeeper.calculate_position_size(metrics['current_price'], metrics['stop_loss'])
         if qty > 0:
             order_id = execute_alpaca_order(ticker, qty, metrics['current_price'], metrics['stop_loss'], metrics['take_profit'])
@@ -523,7 +524,7 @@ def run_trading_cycle():
     
     # Kicks off your CrewAI agents & trading pipeline
     try:
-        report = generate_intelligence_report()
+       report = generate_and_send_crewai_report_async()
         print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Intelligence report generated successfully.")
     except Exception as e:
         print(f"[ERROR] Agent execution failed: {e}")
@@ -541,4 +542,4 @@ if __name__ == "__main__":
         
         # Pause for 15 minutes (900 seconds) between market scans
         print("Sleeping for 15 minutes until next market scan...")
-        time.sleep(900)
+        time.sleep(300)
