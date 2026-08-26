@@ -48,7 +48,6 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 ALPACA_API_KEY = os.getenv("ALPACA_API_KEY")
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
 PAPER_TRADING = True  # Set to False only when going live
-
 DEBUG_VERBOSE = True
 
 if not all([OPENAI_API_KEY, ALPACA_API_KEY, ALPACA_SECRET_KEY]):
@@ -59,7 +58,7 @@ trading_client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=PAPER_TR
 data_client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
 
 DB_FILE = "paper_trail_audit_v5.db"
-RISK_PER_TRADE_PCT = 0.05  # 5% equity risk
+DEFAULT_DOLLAR_ALLOCATION = 1000.0  # Target dollar amount per trade
 LLM_COOLDOWN_SECONDS = 900  # 15-minute cooldown per ticker for LLM API calls
 EASTERN_TZ = ZoneInfo("America/New_York")
 
@@ -123,8 +122,10 @@ def fetch_sec_executive_trades(ticker_symbol: str) -> str:
     cik = SEC_CIK_MAP.get(ticker_symbol.upper())
     if not cik:
         return f"No SEC CIK mapping configured for {ticker_symbol}."
+    
     headers = {'User-Agent': 'MarketResearchApp admin@marketresearch.com'}
     url = f"https://data.sec.gov/submissions/CIK{cik}.json"
+    
     try:
         res = requests.get(url, headers=headers)
         if res.status_code == 200:
@@ -132,7 +133,12 @@ def fetch_sec_executive_trades(ticker_symbol: str) -> str:
             recent_filings = data['filings']['recent']
             forms = recent_filings['form'][:10]
             dates = recent_filings['filingDate'][:10]
-            insider_activity = [f"{form} on {date}" for form, date in zip(forms, dates) if form == '4']
+            
+            insider_activity = [
+                f"{form} on {date}" 
+                for form, date in zip(forms, dates) 
+                if form == '4'
+            ]
             return f"Recent Form 4 Filings ({ticker_symbol}): {', '.join(insider_activity) if insider_activity else 'No recent Form 4 filings.'}"
         return f"SEC Data stream unavailable (Status {res.status_code})."
     except Exception as e:
@@ -192,7 +198,6 @@ def _run_crewai_report_task():
         process=Process.sequential,
         verbose=True
     )
-
     try:
         result = crew.kickoff()
         report_text = result.raw if hasattr(result, 'raw') else str(result)
@@ -208,21 +213,21 @@ def send_daily_email(html_summary: str):
     sender_email = (os.getenv("SENDER_EMAIL") or "").strip()
     app_password = (os.getenv("SENDER_APP_PASSWORD") or "").strip()
     recipient = (os.getenv("RECIPIENT_EMAIL") or "").strip()
-
+    
     if not all([sender_email, app_password, recipient]):
         logging.error("[EMAIL ERROR] Missing email credentials.")
         return
-
+        
     clean_content = str(html_summary).replace('\xa0', ' ')
     email_html = f"<html><body>{clean_content}</body></html>"
-
+    
     msg = EmailMessage()
     msg['Subject'] = "12 PM Market Intel Report"
     msg['From'] = sender_email
     msg['To'] = recipient
     msg.set_content("Your email reader does not support HTML.", charset='utf-8')
     msg.add_alternative(email_html, subtype='html')
-
+    
     try:
         with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
             server.login(sender_email, app_password)
@@ -240,21 +245,36 @@ def init_db():
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS llm_decisions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT, ticker TEXT, asset_class TEXT, action TEXT,
-                bearish_thesis TEXT, confidence REAL, executed INTEGER
+                timestamp TEXT,
+                ticker TEXT,
+                asset_class TEXT,
+                action TEXT,
+                bearish_thesis TEXT,
+                confidence REAL,
+                executed INTEGER
             )
         ''')
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS broker_executions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT, ticker TEXT, side TEXT, qty REAL, price REAL,
-                stop_loss REAL, take_profit REAL, alpaca_order_id TEXT, status TEXT
+                timestamp TEXT,
+                ticker TEXT,
+                side TEXT,
+                qty REAL,
+                price REAL,
+                stop_loss REAL,
+                take_profit REAL,
+                alpaca_order_id TEXT,
+                status TEXT
             )
         ''')
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS diagnostic_log (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT, ticker TEXT, stage TEXT, detail TEXT
+                timestamp TEXT,
+                ticker TEXT,
+                stage TEXT,
+                detail TEXT
             )
         ''')
         conn.commit()
@@ -294,7 +314,7 @@ def log_execution(timestamp, ticker, side, qty, price, stop_loss, take_profit, a
         conn.commit()
 
 # =====================================================================
-# 4. TECHNICAL GATEKEEPER & POSITION SIZER
+# 4. TECHNICAL GATEKEEPER
 # =====================================================================
 class TechnicalGatekeeper:
     @staticmethod
@@ -305,53 +325,51 @@ class TechnicalGatekeeper:
     def calculate_indicators(ticker: str, df_1m: pd.DataFrame, df_4h: pd.DataFrame) -> dict:
         asset_class = TechnicalGatekeeper.get_asset_class(ticker)
         params = RISK_PARAMS[asset_class]
-
+        
         # 1. Macro Uptrend Check
         df_4h['ema50'] = df_4h['close'].ewm(span=50, adjust=False).mean()
         macro_uptrend = bool(df_4h['close'].iloc[-1] > df_4h['ema50'].iloc[-1])
-
+        
         # 2. VWAP Check
         v = df_1m['volume']
         tp = (df_1m['high'] + df_1m['low'] + df_1m['close']) / 3
         vwap = (tp * v).cumsum() / (v.cumsum() + 1e-9)
         current_vwap = vwap.iloc[-1]
         above_vwap = bool(df_1m['close'].iloc[-1] > current_vwap)
-
+        
         # 3. RVOL Check
         avg_volume = df_1m['volume'].tail(20).mean()
         current_volume = df_1m['volume'].iloc[-1]
         rvol = current_volume / avg_volume if avg_volume > 0 else 0.0
         rvol_passed = bool(rvol >= params['min_rvol'])
-
+        
         # ATR & Price Calculations
         high_low = df_1m['high'] - df_1m['low']
         high_close = np.abs(df_1m['high'] - df_1m['close'].shift())
         low_close = np.abs(df_1m['low'] - df_1m['close'].shift())
         tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
         atr = tr.rolling(14).mean().iloc[-1]
-
+        
         current_price = float(df_1m['close'].iloc[-1])
         recent_high = float(df_1m['high'].iloc[-4:-1].max())
-
+        
         # 4. Breakout Check with 0.1% Buffer
-        breakout_threshold = recent_high * 0.999 
+        breakout_threshold = recent_high * 0.999
         is_breakout = bool(current_price >= breakout_threshold)
-
+        
         # N-of-4 Scoring Gatekeeper
         conditions_passed = sum([macro_uptrend, above_vwap, rvol_passed, is_breakout])
         passed_filter = bool(conditions_passed >= 3)
-
+        
         stop_loss = round(current_price - (params['sl_atr_mult'] * atr), 2)
         take_profit = round(current_price + (params['sl_atr_mult'] * atr * params['rr_target']), 2)
-
-        log_diagnostic(
-            ticker,
-            "FILTER",
+        
+        log_diagnostic(ticker, "FILTER", 
             f"score={conditions_passed}/4 | passed={passed_filter} | "
             f"macro={macro_uptrend} | vwap={above_vwap} (P:{round(current_price,2)} vs V:{round(current_vwap,2)}) | "
             f"rvol={rvol_passed} ({round(rvol,2)}x) | breakout={is_breakout} (P:{round(current_price,2)} vs Thresh:{round(breakout_threshold,2)})"
         )
-
+        
         return {
             "passed": passed_filter,
             "score": conditions_passed,
@@ -366,23 +384,6 @@ class TechnicalGatekeeper:
             "min_rvol_required": params['min_rvol']
         }
 
-    @staticmethod
-    def calculate_position_size(entry_price: float, stop_loss_price: float) -> float:
-        try:
-            account = trading_client.get_account()
-            equity = float(account.equity)
-        except Exception as e:
-            logging.error(f"[ERROR] Could not fetch Alpaca equity: {e}")
-            equity = 1000.0
-
-        risk_per_share = abs(entry_price - stop_loss_price)
-        if risk_per_share == 0:
-            return 0.0
-
-        max_capital_risk = equity * RISK_PER_TRADE_PCT
-        shares = max_capital_risk / risk_per_share
-        return round(shares, 4)
-
 # =====================================================================
 # 5. QUALITATIVE LLM RISK ADVERSARY
 # =====================================================================
@@ -396,9 +397,8 @@ def run_llm_strategy_agent(ticker: str, metrics: dict, bypass_cache: bool = Fals
     if not bypass_cache and ticker in DECISION_CACHE:
         cached_decision, cached_time = DECISION_CACHE[ticker]
         if now - cached_time < LLM_COOLDOWN_SECONDS:
-            log_diagnostic(ticker, "LLM_CACHE_HIT",
-                            f"returning cached decision from {int(now - cached_time)}s ago: "
-                            f"action={cached_decision.action} confidence={cached_decision.confidence_score}")
+            log_diagnostic(ticker, "LLM_CACHE_HIT", f"returning cached decision from {int(now - cached_time)}s ago: "
+                                                    f"action={cached_decision.action} confidence={cached_decision.confidence_score}")
             return cached_decision
 
     prompt = (
@@ -422,11 +422,8 @@ def run_llm_strategy_agent(ticker: str, metrics: dict, bypass_cache: bool = Fals
         )
         decision = completion.choices[0].message.parsed
         DECISION_CACHE[ticker] = (decision, now)
-        log_diagnostic(
-            ticker, "LLM_DECISION",
-            f"action={decision.action} confidence={decision.confidence_score} "
-            f"(need action=BUY and confidence>=0.50) thesis={decision.bearish_thesis[:120]}"
-        )
+        log_diagnostic(ticker, "LLM_DECISION", f"action={decision.action} confidence={decision.confidence_score} "
+                                                f"(need action=BUY and confidence>=0.50) thesis={decision.bearish_thesis[:120]}")
         return decision
     except Exception as e:
         log_diagnostic(ticker, "LLM_ERROR", str(e))
@@ -436,69 +433,39 @@ def run_llm_strategy_agent(ticker: str, metrics: dict, bypass_cache: bool = Fals
 # =====================================================================
 # 6. EXECUTION PIPELINE & BROKER INTERACTIONS
 # =====================================================================
-def execute_alpaca_order(ticker: str, qty: float, price: float, stop_loss: float, take_profit: float) -> Optional[str]:
+def place_alpaca_order(symbol: str, target_dollar_amount: float = DEFAULT_DOLLAR_ALLOCATION) -> Optional[str]:
+    """Submits a fixed-dollar fractional market order with time_in_force='day' using Alpaca SDK."""
     try:
-        # Market Order with fractional support (time_in_force MUST be 'day')
         order_data = MarketOrderRequest(
-            symbol=ticker,
-            qty=qty,
+            symbol=symbol,
+            notional=target_dollar_amount,
             side=OrderSide.BUY,
             time_in_force=TimeInForce.DAY
         )
         order = trading_client.submit_order(order_data)
-        logging.info(f"🚀 [EXECUTION TRIGGERED] {qty} shares of {ticker} | Order ID: {order.id}")
-
-        # Post-entry risk management: Attach stop-loss and limit exit legs separately
-        # (Alpaca API disables Bracket orders when submitting fractional share orders)
-        try:
-            sl_order = StopOrderRequest(
-                symbol=ticker,
-                qty=qty,
-                side=OrderSide.SELL,
-                stop_price=stop_loss,
-                time_in_force=TimeInForce.DAY
-            )
-            trading_client.submit_order(sl_order)
-
-            tp_order = LimitOrderRequest(
-                symbol=ticker,
-                qty=qty,
-                side=OrderSide.SELL,
-                limit_price=take_profit,
-                time_in_force=TimeInForce.DAY
-            )
-            trading_client.submit_order(tp_order)
-            logging.info(f"🛡️ [RISK LEGS ATTACHED] {ticker} SL: ${stop_loss} | TP: ${take_profit}")
-        except Exception as leg_err:
-            logging.warning(f"[WARNING] Secondary stop/take-profit leg failed for {ticker}: {leg_err}")
-
+        logging.info(f"🚀 [EXECUTION TRIGGERED] ${target_dollar_amount:.2f} allocated to {symbol} | Order ID: {order.id}")
         return str(order.id)
     except Exception as e:
-        log_diagnostic(ticker, "ORDER_ERROR", str(e))
-        logging.error(f"[ERROR] Alpaca Order Execution Failed: {e}")
+        log_diagnostic(symbol, "ORDER_ERROR", str(e))
+        logging.error(f"Alpaca Order Execution Failed for {symbol}: {e}")
         return None
 
 def evaluate_and_process_ticker(ticker: str, metrics: dict):
     score = metrics.get("score", 0)
     timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat()
-    
-    qty = TechnicalGatekeeper.calculate_position_size(metrics['current_price'], metrics['stop_loss'])
-    if qty <= 0:
-        log_diagnostic(ticker, "SKIP", "qty computed as 0 (risk_per_share was 0 or equity fetch failed)")
-        return
+    est_qty = round(DEFAULT_DOLLAR_ALLOCATION / metrics['current_price'], 4) if metrics['current_price'] > 0 else 0
 
     # PATH A: AUTO-EXECUTE HIGH TECHNICAL SETUPS (Score 3/4 or 4/4)
     if score >= 3:
         logging.info(f"🚀 [{ticker}] High Technical Setup Triggered ({score}/4)! Bypassing LLM Adversary...")
-        order_id = execute_alpaca_order(ticker, qty, metrics['current_price'], metrics['stop_loss'], metrics['take_profit'])
+        order_id = place_alpaca_order(ticker, DEFAULT_DOLLAR_ALLOCATION)
         if order_id:
-            log_execution(timestamp, ticker, "BUY", qty, metrics['current_price'], metrics['stop_loss'], metrics['take_profit'], order_id)
+            log_execution(timestamp, ticker, "BUY", est_qty, metrics['current_price'], metrics['stop_loss'], metrics['take_profit'], order_id)
         return
 
     # PATH B: AMBIGUOUS SETUPS (Score < 3) - RUN LLM ADVERSARY
     logging.info(f"[{ticker}] Technical score {score}/4 below auto-buy threshold. Running LLM Adversary...")
     decision = run_llm_strategy_agent(ticker, metrics, bypass_cache=True)
-    
     if not decision:
         log_diagnostic(ticker, "SKIP", "LLM returned no decision")
         return
@@ -506,13 +473,13 @@ def evaluate_and_process_ticker(ticker: str, metrics: dict):
     executed = 0
     if decision.action == "BUY" and decision.confidence_score >= 0.50:
         logging.info(f"[{ticker}] LLM Approved ({decision.action} @ {decision.confidence_score} confidence)")
-        order_id = execute_alpaca_order(ticker, qty, metrics['current_price'], metrics['stop_loss'], metrics['take_profit'])
+        order_id = place_alpaca_order(ticker, DEFAULT_DOLLAR_ALLOCATION)
         if order_id:
             executed = 1
-            log_execution(timestamp, ticker, "BUY", qty, metrics['current_price'], metrics['stop_loss'], metrics['take_profit'], order_id)
+            log_execution(timestamp, ticker, "BUY", est_qty, metrics['current_price'], metrics['stop_loss'], metrics['take_profit'], order_id)
     else:
         logging.info(f"[DIAG] {ticker} | SKIP | LLM did not clear bar: action={decision.action} confidence={decision.confidence_score}")
-
+    
     log_decision(timestamp, ticker, metrics['asset_class'], decision, executed)
 
 def process_pipeline(ticker: str, df_1m: pd.DataFrame, df_4h: pd.DataFrame):
@@ -529,37 +496,46 @@ def process_pipeline(ticker: str, df_1m: pd.DataFrame, df_4h: pd.DataFrame):
 
     metrics = TechnicalGatekeeper.calculate_indicators(ticker, df_1m, df_4h)
     PROCESSED_BARS.append(bar_id)
-    
     evaluate_and_process_ticker(ticker, metrics)
 
 def fetch_market_bars(ticker: str):
     now = datetime.datetime.now(datetime.timezone.utc)
     start_1m = now - datetime.timedelta(days=2)
     start_4h = now - datetime.timedelta(days=30)
-
+    
     request_1m = StockBarsRequest(
-        symbol_or_symbols=ticker, timeframe=TimeFrame.Minute, start=start_1m, feed=DataFeed.IEX
+        symbol_or_symbols=ticker,
+        timeframe=TimeFrame.Minute,
+        start=start_1m,
+        feed=DataFeed.IEX
     )
     request_4h = StockBarsRequest(
-        symbol_or_symbols=ticker, timeframe=TimeFrame.Hour, start=start_4h, feed=DataFeed.IEX
+        symbol_or_symbols=ticker,
+        timeframe=TimeFrame.Hour,
+        start=start_4h,
+        feed=DataFeed.IEX
     )
-
+    
     bars_1m = data_client.get_stock_bars(request_1m).df
     bars_4h = data_client.get_stock_bars(request_4h).df
-
+    
     if bars_1m.empty or bars_4h.empty:
         log_diagnostic(ticker, "DATA_EMPTY", f"1m rows={len(bars_1m)} 4h rows={len(bars_4h)}")
         return None, None
-
+        
     if isinstance(bars_1m.index, pd.MultiIndex):
         bars_1m = bars_1m.xs(ticker)
     if isinstance(bars_4h.index, pd.MultiIndex):
         bars_4h = bars_4h.xs(ticker)
-
+        
     df_4h = bars_4h.resample('4h').agg({
-        'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'
+        'open': 'first',
+        'high': 'max',
+        'low': 'min',
+        'close': 'last',
+        'volume': 'sum'
     }).dropna()
-
+    
     return bars_1m, df_4h
 
 # =====================================================================
@@ -593,6 +569,5 @@ if __name__ == "__main__":
             run_trading_cycle()
         except Exception as e:
             logging.error(f"[ERROR] Unexpected cycle failure: {e}")
-
         logging.info("Sleeping 3 minutes until next market scan...")
         time.sleep(180)
