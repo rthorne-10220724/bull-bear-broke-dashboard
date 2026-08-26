@@ -71,7 +71,7 @@ SEC_CIK_MAP = {
     "COIN": "0001834488"
 }
 
-# NEW:
+# Adjusted Sensitivity Parameters for Active Execution
 RISK_PARAMS = {
     "STANDARD": {
         "min_rvol": 1.2,           # Lowered from 1.8 for earlier entries
@@ -321,7 +321,7 @@ class TechnicalGatekeeper:
         atr = tr.rolling(14).mean().iloc[-1]
 
         current_price = float(df_1m['close'].iloc[-1])
-       recent_5_high = float(df_1m['high'].iloc[-6:-1].max())
+        recent_5_high = float(df_1m['high'].iloc[-6:-1].max())
         is_breakout = current_price > recent_5_high
 
         stop_loss = round(current_price - (params['sl_atr_mult'] * atr), 2)
@@ -438,14 +438,17 @@ def process_pipeline(ticker: str, df_1m: pd.DataFrame, df_4h: pd.DataFrame):
 
     if bar_id in PROCESSED_BARS:
         return
-    PROCESSED_BARS.append(bar_id)
 
-    timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat()
     metrics = TechnicalGatekeeper.calculate_indicators(ticker, df_1m, df_4h)
 
+    # Filter early if technical parameters are not met
     if not metrics['passed']:
         return
 
+    # Deduplicate ONLY after a valid breakout signal passes
+    PROCESSED_BARS.append(bar_id)
+
+    timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat()
     print(f"[{ticker}] {metrics['asset_class']} Technical Breakout Triggered! Running LLM Adversary...")
     decision = run_llm_strategy_agent(ticker, metrics)
 
@@ -453,6 +456,7 @@ def process_pipeline(ticker: str, df_1m: pd.DataFrame, df_4h: pd.DataFrame):
         return
 
     executed = 0
+    # Threshold set to 0.60 confidence score for execution
     if decision.action == "BUY" and decision.confidence_score >= 0.60:
         qty = TechnicalGatekeeper.calculate_position_size(metrics['current_price'], metrics['stop_loss'])
         if qty > 0:
@@ -516,20 +520,25 @@ def fetch_market_bars(ticker: str):
 # =====================================================================
 # 7. UNIFIED MAIN EXECUTION LOOP
 # =====================================================================
-import time
-from datetime import datetime
-
 def run_trading_cycle():
-    print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Starting Market Execution Cycle...")
+    print(f"\n[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Starting Market Execution Cycle...")
     
-    # Kicks off your CrewAI agents & trading pipeline
+    # Kicks off async background intelligence report task
     try:
-       report = generate_and_send_crewai_report_async()
-        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Intelligence report generated successfully.")
+        generate_and_send_crewai_report_async()
     except Exception as e:
-        print(f"[ERROR] Agent execution failed: {e}")
+        print(f"[ERROR] CrewAI report task failed: {e}")
+
+    # Process market universe
+    for ticker in ALL_TICKERS:
+        try:
+            bars_1m, df_4h = fetch_market_bars(ticker)
+            if bars_1m is not None and df_4h is not None:
+                process_pipeline(ticker, bars_1m, df_4h)
+        except Exception as e:
+            print(f"[ERROR] Failed processing ticker {ticker}: {e}")
         
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Cycle complete.")
+    print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Cycle complete.")
 
 if __name__ == "__main__":
     print("[ENGINE V5] Continuous Local Trading Loop Active.")
@@ -540,6 +549,6 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"[ERROR] Unexpected cycle failure: {e}")
         
-        # Pause for 15 minutes (900 seconds) between market scans
-        print("Sleeping for 15 minutes until next market scan...")
+        # Pause for 5 minutes (300 seconds) between market scans
+        print("Sleeping for 5 minutes until next market scan...")
         time.sleep(300)
