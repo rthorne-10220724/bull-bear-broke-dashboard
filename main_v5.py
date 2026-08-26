@@ -32,9 +32,10 @@ from alpaca.data.timeframe import TimeFrame
 os.environ["OTEL_SDK_DISABLED"] = "true"
 
 # Force load .env directly from setup path
-env_path = Path(r"C:\MarketAgents\.env")
-load_dotenv(dotenv_path=env_path)
-
+if os.path.exists(r"C:\MarketAgents\.env"):
+    load_dotenv(dotenv_path=Path(r"C:\MarketAgents\.env"))
+else:
+    load_dotenv()
 # =====================================================================
 # 1. GLOBAL CONFIGURATION & ENVIRONMENT SETUP
 # =====================================================================
