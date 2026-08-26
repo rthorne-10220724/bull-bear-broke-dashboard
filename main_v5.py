@@ -21,8 +21,8 @@ from crewai import Agent, Crew, Process, Task, LLM
 
 # Alpaca SDK Imports
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest, StopLossRequest, TakeProfitRequest
-from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
+from alpaca.trading.requests import MarketOrderRequest, StopOrderRequest, LimitOrderRequest
+from alpaca.trading.enums import OrderSide, TimeInForce
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
@@ -438,17 +438,40 @@ def run_llm_strategy_agent(ticker: str, metrics: dict, bypass_cache: bool = Fals
 # =====================================================================
 def execute_alpaca_order(ticker: str, qty: float, price: float, stop_loss: float, take_profit: float) -> Optional[str]:
     try:
+        # Market Order with fractional support (time_in_force MUST be 'day')
         order_data = MarketOrderRequest(
             symbol=ticker,
             qty=qty,
             side=OrderSide.BUY,
-            time_in_force=TimeInForce.GTC,
-            order_class=OrderClass.BRACKET,
-            take_profit=TakeProfitRequest(limit_price=take_profit),
-            stop_loss=StopLossRequest(stop_price=stop_loss)
+            time_in_force=TimeInForce.DAY
         )
         order = trading_client.submit_order(order_data)
-        logging.info(f"🚀 [EXECUTION TRIGGERED] {qty} shares of {ticker} | SL: ${stop_loss} | TP: ${take_profit} | Order ID: {order.id}")
+        logging.info(f"🚀 [EXECUTION TRIGGERED] {qty} shares of {ticker} | Order ID: {order.id}")
+
+        # Post-entry risk management: Attach stop-loss and limit exit legs separately
+        # (Alpaca API disables Bracket orders when submitting fractional share orders)
+        try:
+            sl_order = StopOrderRequest(
+                symbol=ticker,
+                qty=qty,
+                side=OrderSide.SELL,
+                stop_price=stop_loss,
+                time_in_force=TimeInForce.DAY
+            )
+            trading_client.submit_order(sl_order)
+
+            tp_order = LimitOrderRequest(
+                symbol=ticker,
+                qty=qty,
+                side=OrderSide.SELL,
+                limit_price=take_profit,
+                time_in_force=TimeInForce.DAY
+            )
+            trading_client.submit_order(tp_order)
+            logging.info(f"🛡️ [RISK LEGS ATTACHED] {ticker} SL: ${stop_loss} | TP: ${take_profit}")
+        except Exception as leg_err:
+            logging.warning(f"[WARNING] Secondary stop/take-profit leg failed for {ticker}: {leg_err}")
+
         return str(order.id)
     except Exception as e:
         log_diagnostic(ticker, "ORDER_ERROR", str(e))
@@ -456,14 +479,9 @@ def execute_alpaca_order(ticker: str, qty: float, price: float, stop_loss: float
         return None
 
 def evaluate_and_process_ticker(ticker: str, metrics: dict):
-    """
-    Evaluates ticker technical score and determines whether to buy automatically
-    or run through the LLM Adversary gate.
-    """
     score = metrics.get("score", 0)
     timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat()
     
-    # Calculate position size
     qty = TechnicalGatekeeper.calculate_position_size(metrics['current_price'], metrics['stop_loss'])
     if qty <= 0:
         log_diagnostic(ticker, "SKIP", "qty computed as 0 (risk_per_share was 0 or equity fetch failed)")
@@ -569,7 +587,7 @@ def run_trading_cycle():
     logging.info(f"Cycle complete [{now_est.strftime('%Y-%m-%d %H:%M:%S EST')}].")
 
 if __name__ == "__main__":
-    logging.info("[ENGINE V5] Continuous Local Trading Loop Active. (diagnostic build)")
+    logging.info("[ENGINE V5] Continuous Local Trading Loop Active.")
     while True:
         try:
             run_trading_cycle()
