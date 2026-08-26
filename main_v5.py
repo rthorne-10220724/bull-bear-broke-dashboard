@@ -544,12 +544,31 @@ def run_trading_cycle():
 if __name__ == "__main__":
     print("[ENGINE V5] Continuous Local Trading Loop Active.")
     
+    # --- ALPACA EXECUTION TEST ---
+    print("\n--- RUNNING ALPACA CONNECTIVITY TEST ---")
+    try:
+        # Places a 1-share test order with dummy stop-loss and take-profit
+        test_order_id = execute_alpaca_order(
+            ticker="NVDA", 
+            qty=1, 
+            price=120.0, 
+            stop_loss=115.0, 
+            take_profit=130.0
+        )
+        if test_order_id:
+            print(f"[TEST SUCCESS] Submitted test order to Alpaca! Order ID: {test_order_id}")
+        else:
+            print("[TEST FAILED] Order call returned None. Check Render Environment variables.")
+    except Exception as e:
+        print(f"[TEST ERROR] Exception during execution test: {e}")
+    print("----------------------------------------\n")
+
+    # Resume normal 5-minute loop
     while True:
         try:
             run_trading_cycle()
         except Exception as e:
             print(f"[ERROR] Unexpected cycle failure: {e}")
         
-        # Pause for 5 minutes (300 seconds) between market scans
         print("Sleeping for 5 minutes until next market scan...")
         time.sleep(300)
