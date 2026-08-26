@@ -17,7 +17,6 @@ from typing import Literal, Optional
 from pydantic import BaseModel, Field
 from openai import OpenAI
 from crewai import Agent, Crew, Process, Task, LLM
-from crewai.tools import tool
 
 # Alpaca SDK Imports
 from alpaca.trading.client import TradingClient
@@ -26,6 +25,8 @@ from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
+from alpaca.data.enums import DataFeed  # <-- NEW: needed to force the free-tier IEX feed
+from crewai.tools import tool
 
 # Disable OpenTelemetry background warning logs
 os.environ["OTEL_SDK_DISABLED"] = "true"
@@ -43,6 +44,11 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 ALPACA_API_KEY = os.getenv("ALPACA_API_KEY")
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
 PAPER_TRADING = True  # Set to False only when going live
+
+# NEW: master switch for the extra diagnostic prints added throughout this file.
+# Leave True until you've confirmed trades are executing again, then set to False
+# to quiet the console back down.
+DEBUG_VERBOSE = True
 
 if not all([OPENAI_API_KEY, ALPACA_API_KEY, ALPACA_SECRET_KEY]):
     raise ValueError("Missing critical API credentials in environment variables.")
@@ -180,7 +186,7 @@ def _run_crewai_report_task():
         process=Process.sequential,
         verbose=True
     )
-    
+
     try:
         result = crew.kickoff()
         report_text = result.raw if hasattr(result, 'raw') else str(result)
@@ -196,14 +202,14 @@ def send_daily_email(html_summary: str):
     sender_email = (os.getenv("SENDER_EMAIL") or "").strip()
     app_password = (os.getenv("SENDER_APP_PASSWORD") or "").strip()
     recipient = (os.getenv("RECIPIENT_EMAIL") or "").strip()
-    
+
     if not all([sender_email, app_password, recipient]):
         print("[EMAIL ERROR] Missing email credentials.")
         return
 
     clean_content = str(html_summary).replace('\xa0', ' ')
     email_html = f"<html><body>{clean_content}</body></html>"
-    
+
     msg = EmailMessage()
     msg['Subject'] = "12 PM Market Intel Report"
     msg['From'] = sender_email
@@ -239,9 +245,34 @@ def init_db():
                 stop_loss REAL, take_profit REAL, alpaca_order_id TEXT, status TEXT
             )
         ''')
+        # NEW: every pipeline pass gets logged here, whether or not it reached the LLM.
+        # This is the fastest way to see WHERE a ticker is getting stopped each cycle.
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS diagnostic_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT, ticker TEXT, stage TEXT, detail TEXT
+            )
+        ''')
         conn.commit()
 
 init_db()
+
+def log_diagnostic(ticker: str, stage: str, detail: str):
+    """NEW: lightweight breadcrumb logger. Writes to both console and DB so you
+    can query `SELECT * FROM diagnostic_log ORDER BY id DESC LIMIT 50` later
+    instead of scrolling back through terminal output."""
+    timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    if DEBUG_VERBOSE:
+        print(f"    [DIAG] {ticker} | {stage} | {detail}")
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.execute(
+                "INSERT INTO diagnostic_log (timestamp, ticker, stage, detail) VALUES (?, ?, ?, ?)",
+                (timestamp, ticker, stage, detail)
+            )
+            conn.commit()
+    except Exception as e:
+        print(f"[DIAG-LOG ERROR] Could not write diagnostic row: {e}")
 
 def log_decision(timestamp, ticker, asset_class, d, executed: int):
     with sqlite3.connect(DB_FILE) as conn:
@@ -273,34 +304,45 @@ class TechnicalGatekeeper:
     def calculate_indicators(ticker: str, df_1m: pd.DataFrame, df_4h: pd.DataFrame) -> dict:
         asset_class = TechnicalGatekeeper.get_asset_class(ticker)
         params = RISK_PARAMS[asset_class]
-        
+
         df_4h['ema50'] = df_4h['close'].ewm(span=50, adjust=False).mean()
         macro_uptrend = bool(df_4h['close'].iloc[-1] > df_4h['ema50'].iloc[-1])
-        
+
         v = df_1m['volume']
         tp = (df_1m['high'] + df_1m['low'] + df_1m['close']) / 3
         vwap = (tp * v).cumsum() / (v.cumsum() + 1e-9)
         current_vwap = vwap.iloc[-1]
-        
+
         avg_volume = df_1m['volume'].tail(20).mean()
         current_volume = df_1m['volume'].iloc[-1]
         rvol = current_volume / avg_volume if avg_volume > 0 else 0.0
-        
+
         high_low = df_1m['high'] - df_1m['low']
         high_close = np.abs(df_1m['high'] - df_1m['close'].shift())
         low_close = np.abs(df_1m['low'] - df_1m['close'].shift())
         tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
         atr = tr.rolling(14).mean().iloc[-1]
-        
+
         current_price = float(df_1m['close'].iloc[-1])
         recent_high = float(df_1m['high'].iloc[-4:-1].max())
         is_breakout = current_price >= recent_high
-        
+
         stop_loss = round(current_price - (params['sl_atr_mult'] * atr), 2)
         take_profit = round(current_price + (params['sl_atr_mult'] * atr * params['rr_target']), 2)
-        
+
         passed_filter = bool(macro_uptrend and (current_price > current_vwap) and (rvol >= params['min_rvol']) and is_breakout)
-        
+
+        # NEW: log every individual condition every cycle, not just when everything passes.
+        # This tells you WHICH gate is blocking a given ticker instead of just "no trade."
+        log_diagnostic(
+            ticker,
+            "FILTER",
+            f"passed={passed_filter} | macro_uptrend={macro_uptrend} | "
+            f"price={round(current_price,2)} vwap={round(current_vwap,2)} above_vwap={current_price > current_vwap} | "
+            f"rvol={round(rvol,2)} (need>={params['min_rvol']}) | is_breakout={is_breakout} "
+            f"(price={round(current_price,2)} vs recent_high={round(recent_high,2)})"
+        )
+
         return {
             "passed": passed_filter,
             "asset_class": asset_class,
@@ -322,11 +364,11 @@ class TechnicalGatekeeper:
         except Exception as e:
             print(f"[ERROR] Could not fetch Alpaca equity: {e}")
             equity = 1000.0
-            
+
         risk_per_share = abs(entry_price - stop_loss_price)
         if risk_per_share == 0:
             return 0.0
-            
+
         max_capital_risk = equity * RISK_PER_TRADE_PCT
         shares = max_capital_risk / risk_per_share
         return round(shares, 4)
@@ -344,6 +386,9 @@ def run_llm_strategy_agent(ticker: str, metrics: dict) -> Optional[TradeDecision
     if ticker in DECISION_CACHE:
         cached_decision, cached_time = DECISION_CACHE[ticker]
         if now - cached_time < LLM_COOLDOWN_SECONDS:
+            log_diagnostic(ticker, "LLM_CACHE_HIT",
+                            f"returning cached decision from {int(now - cached_time)}s ago: "
+                            f"action={cached_decision.action} confidence={cached_decision.confidence_score}")
             return cached_decision
 
     prompt = (
@@ -366,8 +411,17 @@ def run_llm_strategy_agent(ticker: str, metrics: dict) -> Optional[TradeDecision
         )
         decision = completion.choices[0].message.parsed
         DECISION_CACHE[ticker] = (decision, now)
+        # NEW: always log what the LLM actually said, pass or fail on confidence.
+        log_diagnostic(
+            ticker, "LLM_DECISION",
+            f"action={decision.action} confidence={decision.confidence_score} "
+            f"(need action=BUY and confidence>=0.50) thesis={decision.bearish_thesis[:120]}"
+        )
         return decision
     except Exception as e:
+        # This used to just print - now it's also written to the DB so it survives
+        # a restart / isn't lost if you're not watching the console live.
+        log_diagnostic(ticker, "LLM_ERROR", str(e))
         print(f"[ERROR] LLM Query Failed for {ticker}: {e}")
         return None
 
@@ -389,21 +443,27 @@ def execute_alpaca_order(ticker: str, qty: float, price: float, stop_loss: float
         print(f"[ALPACA BRACKET ORDER SUBMITTED] {qty} shares of {ticker} | SL: ${stop_loss} | TP: ${take_profit} | Order ID: {order.id}")
         return str(order.id)
     except Exception as e:
+        # NEW: this is a common silent-failure point (buying power, fractionability,
+        # market closed, bracket-order validation). Now it's captured in diagnostic_log too.
+        log_diagnostic(ticker, "ORDER_ERROR", str(e))
         print(f"[ERROR] Alpaca Order Execution Failed: {e}")
         return None
 
 def process_pipeline(ticker: str, df_1m: pd.DataFrame, df_4h: pd.DataFrame):
     current_time_est = datetime.datetime.now(EASTERN_TZ).time()
     if current_time_est >= datetime.time(15, 45):
+        log_diagnostic(ticker, "SKIP", f"past 15:45 EST cutoff ({current_time_est})")
         return
 
     bar_time = df_1m.index[-1]
     bar_id = f"{ticker}_{bar_time}"
     if bar_id in PROCESSED_BARS:
+        log_diagnostic(ticker, "SKIP", f"bar {bar_time} already processed")
         return
 
     metrics = TechnicalGatekeeper.calculate_indicators(ticker, df_1m, df_4h)
     if not metrics['passed']:
+        # (Detailed reason already logged inside calculate_indicators above.)
         return
 
     PROCESSED_BARS.append(bar_id)
@@ -412,16 +472,23 @@ def process_pipeline(ticker: str, df_1m: pd.DataFrame, df_4h: pd.DataFrame):
 
     decision = run_llm_strategy_agent(ticker, metrics)
     if not decision:
+        log_diagnostic(ticker, "SKIP", "LLM returned no decision (see LLM_ERROR above)")
         return
 
     executed = 0
     if decision.action == "BUY" and decision.confidence_score >= 0.50:
         qty = TechnicalGatekeeper.calculate_position_size(metrics['current_price'], metrics['stop_loss'])
+        log_diagnostic(ticker, "SIZING", f"qty={qty} entry={metrics['current_price']} stop={metrics['stop_loss']}")
         if qty > 0:
             order_id = execute_alpaca_order(ticker, qty, metrics['current_price'], metrics['stop_loss'], metrics['take_profit'])
             if order_id:
                 executed = 1
                 log_execution(timestamp, ticker, "BUY", qty, metrics['current_price'], metrics['stop_loss'], metrics['take_profit'], order_id)
+        else:
+            log_diagnostic(ticker, "SKIP", "qty computed as 0 (risk_per_share was 0 or equity fetch failed)")
+    else:
+        log_diagnostic(ticker, "SKIP",
+                        f"LLM did not clear bar: action={decision.action} confidence={decision.confidence_score}")
 
     log_decision(timestamp, ticker, metrics['asset_class'], decision, executed)
 
@@ -430,13 +497,24 @@ def fetch_market_bars(ticker: str):
     start_1m = now - datetime.timedelta(days=2)
     start_4h = now - datetime.timedelta(days=30)
 
-    request_1m = StockBarsRequest(symbol_or_symbols=ticker, timeframe=TimeFrame.Minute, start=start_1m)
-    request_4h = StockBarsRequest(symbol_or_symbols=ticker, timeframe=TimeFrame.Hour, start=start_4h)
+    # NEW: explicitly request the free-tier IEX feed. Without this, alpaca-py
+    # requests the "best available" feed, which on an account with no market
+    # data subscription means SIP -> a 403 on anything within the last ~15 min.
+    # That exception was previously only visible as a generic "[ERROR] Failed
+    # processing ticker" line in the outer loop, which silently killed the
+    # pipeline for that ticker every single cycle.
+    request_1m = StockBarsRequest(
+        symbol_or_symbols=ticker, timeframe=TimeFrame.Minute, start=start_1m, feed=DataFeed.IEX
+    )
+    request_4h = StockBarsRequest(
+        symbol_or_symbols=ticker, timeframe=TimeFrame.Hour, start=start_4h, feed=DataFeed.IEX
+    )
 
     bars_1m = data_client.get_stock_bars(request_1m).df
     bars_4h = data_client.get_stock_bars(request_4h).df
 
     if bars_1m.empty or bars_4h.empty:
+        log_diagnostic(ticker, "DATA_EMPTY", f"1m rows={len(bars_1m)} 4h rows={len(bars_4h)}")
         return None, None
 
     if isinstance(bars_1m.index, pd.MultiIndex):
@@ -471,17 +549,21 @@ def run_trading_cycle():
             if bars_1m is not None and df_4h is not None:
                 process_pipeline(ticker, bars_1m, df_4h)
         except Exception as e:
+            # NEW: this used to be the dead end where SIP-permission errors (and
+            # anything else) disappeared. Now the full exception type + message
+            # is captured in diagnostic_log so you can query it after the fact.
+            log_diagnostic(ticker, "FETCH_ERROR", f"{type(e).__name__}: {e}")
             print(f"[ERROR] Failed processing ticker {ticker}: {e}")
 
     print(f"[{now_est.strftime('%Y-%m-%d %H:%M:%S')}] Cycle complete.")
 
 if __name__ == "__main__":
-    print("[ENGINE V5] Continuous Local Trading Loop Active.")
+    print("[ENGINE V5] Continuous Local Trading Loop Active. (diagnostic build)")
     while True:
         try:
             run_trading_cycle()
         except Exception as e:
             print(f"[ERROR] Unexpected cycle failure: {e}")
-            
+
         print("Sleeping 3 minutes until next market scan...")
         time.sleep(180)
