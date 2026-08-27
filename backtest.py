@@ -7,16 +7,20 @@ from typing import List, Dict, Any
 from supabase import create_client, Client
 
 # =====================================================================
-# SUPABASE SETUP
+# SUPABASE INITIALIZATION
 # =====================================================================
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
 supabase: Client = None
 if SUPABASE_URL and SUPABASE_KEY:
-    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+    try:
+        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+        print("Connected to Supabase successfully.")
+    except Exception as e:
+        print(f"⚠️ Failed to initialize Supabase client: {e}")
 else:
-    print("⚠️ Supabase credentials not found. Results will only print to console.")
+    print("⚠️ Supabase environment variables missing. Results will only print to console.")
 
 # =====================================================================
 # BACKTEST CONFIGURATION (Matching Engine Settings)
@@ -125,7 +129,7 @@ if __name__ == "__main__":
     print(f"OVERALL SUMMARY: {total_all_trades} Total Trades | Avg Win Rate: {avg_win_rate:.1f}% | Net Strategy P&L: ${total_all_pnl:.2f}")
     print("=========================================================")
 
-    # Log results to Supabase if connected
+    # Push metrics to Supabase
     if supabase:
         try:
             payload = {
@@ -136,6 +140,6 @@ if __name__ == "__main__":
                 "ticker_summary": summary
             }
             supabase.table("backtest_runs").insert(payload).execute()
-            print("Successfully saved backtest results to Supabase.")
+            print("🚀 Successfully saved backtest results to Supabase.")
         except Exception as e:
             print(f"❌ Failed to push results to Supabase: {e}")
