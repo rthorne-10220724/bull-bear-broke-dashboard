@@ -46,15 +46,14 @@ logger.addHandler(file_handler)
 decision_logger = logging.getLogger("trading_engine.decisions")
 decision_logger.setLevel(logging.INFO)
 decision_logger.propagate = False
+
 decision_handler = RotatingFileHandler(os.path.join(LOG_DIR, "decisions.log"), maxBytes=10_000_000, backupCount=5)
 decision_handler.setFormatter(logging.Formatter("%(asctime)s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
 decision_logger.addHandler(decision_handler)
 decision_logger.addHandler(console_handler)
 
-
 def log_decision(cycle_id: str, ticker: str, action: str, reason: str):
     decision_logger.info(f"[{cycle_id}] {ticker:<6} | {action:<20} | {reason}")
-
 
 # =====================================================================
 # 2. CONFIG & EXPANDED SECTOR BUCKETS
@@ -107,7 +106,6 @@ FOUR_HOUR_CACHE: Dict[str, Tuple[pd.DataFrame, datetime.datetime]] = {}
 TRADING_HALTED_FOR_DAY = False
 HALT_DATE: Optional[datetime.date] = None
 
-
 def reset_daily_halt_if_new_day():
     global TRADING_HALTED_FOR_DAY, HALT_DATE
     today = datetime.datetime.now(EASTERN_TZ).date()
@@ -115,13 +113,11 @@ def reset_daily_halt_if_new_day():
         TRADING_HALTED_FOR_DAY = False
         HALT_DATE = today
 
-
 def get_ticker_bucket(ticker: str) -> Optional[str]:
     for bucket, tickers in SECTOR_BUCKETS.items():
         if ticker in tickers:
             return bucket
     return None
-
 
 # =====================================================================
 # 3. DATABASE
@@ -145,7 +141,6 @@ def init_db():
 
 init_db()
 
-
 def log_diagnostic(cycle_id: str, ticker: str, action: str, reason: str, details: str = ""):
     now_str = datetime.datetime.now(EASTERN_TZ).strftime("%Y-%m-%d %H:%M:%S EST")
     try:
@@ -158,7 +153,6 @@ def log_diagnostic(cycle_id: str, ticker: str, action: str, reason: str, details
             conn.commit()
     except Exception as e:
         logger.error(f"[DB ERROR] Failed to log diagnostic: {e}")
-
 
 # =====================================================================
 # 4. PORTFOLIO & RISK HELPERS
@@ -190,14 +184,14 @@ def audit_portfolio_risk_state(cycle_id: str, active_positions: List[Any]) -> Li
                         trading_client.cancel_order_by_id(order.id)
                 except Exception as e:
                     logger.error(f"[{pos.symbol}] Failed cancelling open orders: {e}")
+                
                 trading_client.close_position(pos.symbol)
                 log_diagnostic(cycle_id, pos.symbol, "FALLBACK_STOP", f"plpc={unrealized_plpc:.2%}")
 
     except Exception as e:
         logger.error(f"[RISK AUDIT ERROR] Failed checking portfolio state: {e}")
-
+    
     return active_positions
-
 
 def close_all_open_positions(cycle_id: str):
     try:
@@ -206,7 +200,6 @@ def close_all_open_positions(cycle_id: str):
         log_diagnostic(cycle_id, "PORTFOLIO", "LIQUIDATION_COMPLETE", "All positions closed")
     except Exception as e:
         logger.error(f"[LIQUIDATION ERROR] Failed liquidating positions: {e}")
-
 
 # =====================================================================
 # 5. MARKET DATA & TECHNICAL ANALYSIS
@@ -223,26 +216,33 @@ def fetch_4h_bars_cached(ticker: str) -> Optional[pd.DataFrame]:
         df_4h = ticker_obj.history(period="10d", interval="60m")
         if not df_4h.empty:
             df_4h = df_4h.resample("4h").agg({
-                'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'
+                'Open': 'first',
+                'High': 'max',
+                'Low': 'min',
+                'Close': 'last',
+                'Volume': 'sum'
             }).dropna()
             FOUR_HOUR_CACHE[ticker] = (df_4h, now_utc)
             return df_4h
     except Exception as e:
         logger.error(f"[{ticker}] Failed fetching 4h bars: {e}")
-        if ticker in FOUR_HOUR_CACHE:
-            return FOUR_HOUR_CACHE[ticker][0]
 
+    if ticker in FOUR_HOUR_CACHE:
+        return FOUR_HOUR_CACHE[ticker][0]
     return None
-
 
 def fetch_market_bars(ticker: str) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
     now_utc = datetime.datetime.now(datetime.timezone.utc)
     start_utc = now_utc - datetime.timedelta(days=5)
-
+    
+    bars_1m = None
     try:
         request = StockBarsRequest(
-            symbol_or_symbols=ticker, timeframe=TimeFrame.Minute,
-            start=start_utc, end=now_utc, feed=DataFeed.IEX,
+            symbol_or_symbols=ticker,
+            timeframe=TimeFrame.Minute,
+            start=start_utc,
+            end=now_utc,
+            feed=DataFeed.IEX,
         )
         bars_1m = data_client.get_stock_bars(request).df
         if isinstance(bars_1m.index, pd.MultiIndex):
@@ -252,9 +252,7 @@ def fetch_market_bars(ticker: str) -> Tuple[Optional[pd.DataFrame], Optional[pd.
         bars_1m = None
 
     df_4h = fetch_4h_bars_cached(ticker)
-
     return bars_1m, df_4h
-
 
 def analyze_indicators(df_1m: pd.DataFrame, df_4h: pd.DataFrame) -> Dict[str, Any]:
     close_1m = df_1m['close'] if 'close' in df_1m.columns else df_1m['Close']
@@ -263,6 +261,7 @@ def analyze_indicators(df_1m: pd.DataFrame, df_4h: pd.DataFrame) -> Dict[str, An
     vol_1m = df_1m['volume'] if 'volume' in df_1m.columns else df_1m['Volume']
 
     rsi_1m = ta.momentum.rsi(close_1m, window=14).iloc[-1]
+    
     vol_sma20 = vol_1m.shift(1).rolling(20).mean().iloc[-1]
     vol_spike = vol_1m.iloc[-1] > (1.2 * vol_sma20) if pd.notna(vol_sma20) and vol_sma20 > 0 else False
 
@@ -275,11 +274,16 @@ def analyze_indicators(df_1m: pd.DataFrame, df_4h: pd.DataFrame) -> Dict[str, An
     ema_20 = ta.trend.ema_indicator(close_4h, window=20).iloc[-1]
     ema_50 = ta.trend.ema_indicator(close_4h, window=50).iloc[-1]
 
-    high_low = high_1m - low_1m
-    high_close = (high_1m - close_1m.shift()).abs()
-    low_close = (low_1m - close_1m.shift()).abs()
-    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-    atr_1m = tr.rolling(14).mean().iloc[-1]
+    # FIX: Restored 15-minute ATR calculation to prevent noise whipsaws on 1m bars
+    df_15m_high = high_1m.resample("15min").agg('max')
+    df_15m_low = low_1m.resample("15min").agg('min')
+    df_15m_close = close_1m.resample("15min").agg('last')
+    
+    hl_15m = df_15m_high - df_15m_low
+    hc_15m = (df_15m_high - df_15m_close.shift()).abs()
+    lc_15m = (df_15m_low - df_15m_close.shift()).abs()
+    tr_15m = pd.concat([hl_15m, hc_15m, lc_15m], axis=1).max(axis=1)
+    atr_15m = tr_15m.rolling(14).mean().iloc[-1]
 
     return {
         "rsi_1m": rsi_1m,
@@ -287,27 +291,25 @@ def analyze_indicators(df_1m: pd.DataFrame, df_4h: pd.DataFrame) -> Dict[str, An
         "macd_15m_diff": macd_15m_val,
         "trend_4h": "BULLISH" if ema_20 > ema_50 else "BEARISH",
         "latest_price": float(close_1m.iloc[-1]),
-        "atr_1m": float(atr_1m) if pd.notna(atr_1m) and atr_1m > 0 else float(close_1m.iloc[-1]) * 0.01,
+        "atr_15m": float(atr_15m) if pd.notna(atr_15m) and atr_15m > 0 else float(close_1m.iloc[-1]) * 0.01,
     }
-
 
 def process_pipeline(cycle_id: str, ticker: str, bars_1m: pd.DataFrame, df_4h: pd.DataFrame, active_positions: List[Any]):
     latest_bar_time = bars_1m.index[-1]
     if ticker in PROCESSED_BARS and PROCESSED_BARS[ticker] == latest_bar_time:
         log_decision(cycle_id, ticker, "SKIP", f"Bar already processed ({latest_bar_time})")
         return
-
     PROCESSED_BARS[ticker] = latest_bar_time
-    indicators = analyze_indicators(bars_1m, df_4h)
 
+    indicators = analyze_indicators(bars_1m, df_4h)
     rsi = indicators["rsi_1m"]
     vol_spike = indicators["vol_spike"]
     macd_15m = indicators["macd_15m_diff"]
     trend = indicators["trend_4h"]
     latest_price = indicators["latest_price"]
-    atr = indicators["atr_1m"]
-    pos_symbols = [p.symbol for p in active_positions]
+    atr = indicators["atr_15m"]
 
+    pos_symbols = [p.symbol for p in active_positions]
     if ticker in pos_symbols:
         log_decision(cycle_id, ticker, "HOLD", "Position already active")
         return
@@ -322,9 +324,10 @@ def process_pipeline(cycle_id: str, ticker: str, bars_1m: pd.DataFrame, df_4h: p
             log_decision(cycle_id, ticker, "HOLD_SECTOR_CAP", f"Bucket '{ticker_bucket}' active via {pos}")
             return
 
-    if rsi >= 30 or not vol_spike or trend != "BULLISH" or macd_15m <= 0:
+    # FIX: Resolved the logic contradiction by checking momentum continuation (RSI > 50) rather than requiring an oversold dip in a strong bull trend
+    if rsi <= 50 or not vol_spike or trend != "BULLISH" or macd_15m <= 0:
         reasons = []
-        if rsi >= 30: reasons.append(f"RSI {rsi:.2f}>=30")
+        if rsi <= 50: reasons.append(f"RSI {rsi:.2f}<=50")
         if not vol_spike: reasons.append("no vol spike")
         if trend != "BULLISH": reasons.append(f"4h trend {trend}")
         if macd_15m <= 0: reasons.append(f"15m MACD {macd_15m:.3f}<=0")
@@ -354,7 +357,6 @@ def process_pipeline(cycle_id: str, ticker: str, bars_1m: pd.DataFrame, df_4h: p
         qty = int(max_position_dollars // latest_price)
 
     allocated_dollars = qty * latest_price
-
     if qty < 1 or allocated_dollars > buying_power:
         log_decision(cycle_id, ticker, "HOLD_ALLOCATION", f"qty={qty}, cost=${allocated_dollars:.2f}")
         return
@@ -367,8 +369,12 @@ def process_pipeline(cycle_id: str, ticker: str, bars_1m: pd.DataFrame, df_4h: p
 
     try:
         order_data = LimitOrderRequest(
-            symbol=ticker, qty=qty, side=OrderSide.BUY, time_in_force=TimeInForce.DAY,
-            limit_price=limit_entry_price, order_class=OrderClass.BRACKET,
+            symbol=ticker,
+            qty=qty,
+            side=OrderSide.BUY,
+            time_in_force=TimeInForce.DAY,
+            limit_price=limit_entry_price,
+            order_class=OrderClass.BRACKET,
             take_profit=TakeProfitRequest(limit_price=take_profit_price),
             stop_loss=StopLossRequest(stop_price=stop_loss_price),
         )
@@ -379,14 +385,12 @@ def process_pipeline(cycle_id: str, ticker: str, bars_1m: pd.DataFrame, df_4h: p
     except Exception as e:
         logger.error(f"[{ticker}] Order submission error: {e}")
 
-
 # =====================================================================
 # 6. UNIFIED MAIN LOOP
 # =====================================================================
 def run_trading_cycle() -> int:
     cycle_id = uuid.uuid4().hex[:8]
     reset_daily_halt_if_new_day()
-
     now_utc = datetime.datetime.now(datetime.timezone.utc)
     now_est = datetime.datetime.now(EASTERN_TZ)
 
@@ -397,7 +401,6 @@ def run_trading_cycle() -> int:
         active_positions = []
 
     active_positions = audit_portfolio_risk_state(cycle_id, active_positions)
-
     logger.info(f"[CYCLE {cycle_id}] START | {now_est.strftime('%H:%M:%S EST')} | Active positions: {[p.symbol for p in active_positions]}")
 
     if TRADING_HALTED_FOR_DAY:
@@ -410,7 +413,6 @@ def run_trading_cycle() -> int:
         return 180
 
     sleep_interval = 180
-
     if clock.is_open:
         time_to_close = (clock.next_close - now_utc).total_seconds()
         if time_to_close <= 300:
@@ -436,7 +438,6 @@ def run_trading_cycle() -> int:
 
     logger.info(f"[CYCLE {cycle_id}] END | Scanned {scanned}/{len(ALL_TICKERS)} tickers")
     return sleep_interval
-
 
 if __name__ == "__main__":
     logger.info("[ENGINE V6] Continuous scan started across expanded sector categories.")
