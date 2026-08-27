@@ -1,8 +1,22 @@
+import os
 import pandas as pd
 import numpy as np
 import ta
 import yfinance as yf
 from typing import List, Dict, Any
+from supabase import create_client, Client
+
+# =====================================================================
+# SUPABASE SETUP
+# =====================================================================
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+
+supabase: Client = None
+if SUPABASE_URL and SUPABASE_KEY:
+    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+else:
+    print("⚠️ Supabase credentials not found. Results will only print to console.")
 
 # =====================================================================
 # BACKTEST CONFIGURATION (Matching Engine Settings)
@@ -88,8 +102,8 @@ def run_backtest(symbol: str, period: str = "60d", interval: str = "15m") -> Dic
     return {
         "symbol": symbol,
         "total_trades": total_trades,
-        "win_rate": win_rate,
-        "total_pnl": total_pnl
+        "win_rate": round(win_rate, 2),
+        "total_pnl": round(total_pnl, 2)
     }
 
 if __name__ == "__main__":
@@ -103,10 +117,25 @@ if __name__ == "__main__":
         summary.append(res)
         print(f"[{res['symbol']:<5}] Trades: {res['total_trades']:<3} | Win Rate: {res['win_rate']:>5.1f}% | Net P&L: ${res['total_pnl']:>8.2f}")
 
-    total_all_pnl = sum(s['total_pnl'] for s in summary)
-    total_all_trades = sum(s['total_trades'] for s in summary)
-    avg_win_rate = np.mean([s['win_rate'] for s in summary if s['total_trades'] > 0]) if total_all_trades > 0 else 0.0
+    total_all_pnl = float(sum(s['total_pnl'] for s in summary))
+    total_all_trades = int(sum(s['total_trades'] for s in summary))
+    avg_win_rate = float(np.mean([s['win_rate'] for s in summary if s['total_trades'] > 0])) if total_all_trades > 0 else 0.0
 
     print("---------------------------------------------------------")
     print(f"OVERALL SUMMARY: {total_all_trades} Total Trades | Avg Win Rate: {avg_win_rate:.1f}% | Net Strategy P&L: ${total_all_pnl:.2f}")
     print("=========================================================")
+
+    # Log results to Supabase if connected
+    if supabase:
+        try:
+            payload = {
+                "strategy_name": "RSI_VOL_4H_BULL",
+                "total_trades": total_all_trades,
+                "avg_win_rate": round(avg_win_rate, 2),
+                "total_pnl": round(total_all_pnl, 2),
+                "ticker_summary": summary
+            }
+            supabase.table("backtest_runs").insert(payload).execute()
+            print("Successfully saved backtest results to Supabase.")
+        except Exception as e:
+            print(f"❌ Failed to push results to Supabase: {e}")
