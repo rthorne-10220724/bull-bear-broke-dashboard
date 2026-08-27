@@ -1,573 +1,315 @@
 import os
+import sys
 import time
 import sqlite3
-import smtplib
 import datetime
-import requests
+import zoneinfo
 import logging
-import threading
-from pathlib import Path
-from collections import deque
-from zoneinfo import ZoneInfo
-from email.message import EmailMessage
-import numpy as np
-import pandas as pd
-import yfinance as yf
-from dotenv import load_dotenv
-from typing import Literal, Optional
-from pydantic import BaseModel, Field
-from openai import OpenAI
-from crewai import Agent, Crew, Process, Task, LLM
+from typing import Tuple, List, Dict, Optional, Any
 
-# Alpaca SDK Imports
+import pandas as pd
+import numpy as np
+import ta
+import yfinance as yf
+
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest, StopOrderRequest, LimitOrderRequest
-from alpaca.trading.enums import OrderSide, TimeInForce
+from alpaca.trading.requests import MarketOrderRequest, TakeProfitRequest, StopLossRequest
+from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 from alpaca.data.enums import DataFeed
-from crewai.tools import tool
-
-# Disable OpenTelemetry background warning logs
-os.environ["OTEL_SDK_DISABLED"] = "true"
-
-# Configure logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-
-# Safe environment variable loader for Render Linux vs Local Windows
-if os.path.exists(r"C:\MarketAgents\.env"):
-    load_dotenv(dotenv_path=Path(r"C:\MarketAgents\.env"))
-else:
-    load_dotenv()
 
 # =====================================================================
-# 1. GLOBAL CONFIGURATION & ENVIRONMENT SETUP
+# 1. SETUP LOGGING & ENVIRONMENT
 # =====================================================================
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-ALPACA_API_KEY = os.getenv("ALPACA_API_KEY")
-ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
-PAPER_TRADING = True  # Set to False only when going live
-DEBUG_VERBOSE = True
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler("trading_engine.log", mode="a")
+    ]
+)
 
-if not all([OPENAI_API_KEY, ALPACA_API_KEY, ALPACA_SECRET_KEY]):
-    raise ValueError("Missing critical API credentials in environment variables.")
+ALPACA_API_KEY = os.getenv("ALPACA_API_KEY", "")
+ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "")
+PAPER_TRADING = os.getenv("PAPER_TRADING", "true").lower() == "true"
+DEBUG_VERBOSE = os.getenv("DEBUG_VERBOSE", "false").lower() == "true"
 
-openai_client = OpenAI(api_key=OPENAI_API_KEY)
+if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
+    logging.warning("[WARN] Missing Alpaca API credentials in environment variables!")
+
 trading_client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=PAPER_TRADING)
 data_client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
 
-DB_FILE = "paper_trail_audit_v5.db"
-DEFAULT_DOLLAR_ALLOCATION = 1000.0  # Target dollar amount per trade
-LLM_COOLDOWN_SECONDS = 900  # 15-minute cooldown per ticker for LLM API calls
-EASTERN_TZ = ZoneInfo("America/New_York")
+DB_FILE = "trading_decisions.db"
+DEFAULT_DOLLAR_ALLOCATION = 1000.0
+MAX_OPEN_POSITIONS = 3
+ENTRY_COOLDOWN_SECONDS = 3600  # 1-hour per-ticker re-entry cooldown
+EASTERN_TZ = zoneinfo.ZoneInfo("America/New_York")
 
-# Watchlist Universe
-CRYPTO_ADJACENT_TICKERS = {"MSTR", "COIN", "MARA", "RIOT", "CLSK", "BITF", "HUT"}
-STANDARD_TICKERS = {"NVDA", "AMD", "TSLA", "PLTR"}
-ALL_TICKERS = list(CRYPTO_ADJACENT_TICKERS.union(STANDARD_TICKERS))
-
-SEC_CIK_MAP = {
-    "STLD": "0001084712",
-    "NVDA": "0001045810",
-    "TSLA": "0001318605",
-    "MSTR": "0001050446",
-    "AMD": "0000002488",
-    "PLTR": "0001321655",
-    "COIN": "0001834488"
-}
+CRYPTO_ADJACENT_TICKERS = ["MSTR", "COIN", "MARA", "RIOT"]
+STANDARD_TICKERS = ["SPY", "QQQ", "AAPL", "NVDA", "AMD", "MSFT", "TSLA"]
+ALL_TICKERS = STANDARD_TICKERS + CRYPTO_ADJACENT_TICKERS
 
 RISK_PARAMS = {
-    "STANDARD": {
-        "min_rvol": 1.0,
-        "sl_atr_mult": 1.5,
-        "rr_target": 2.5,
-        "trailing_atr_mult": 2.0,
-        "allow_overnight": False
-    },
-    "CRYPTO_ADJACENT": {
-        "min_rvol": 1.0,
-        "sl_atr_mult": 2.0,
-        "rr_target": 3.0,
-        "trailing_atr_mult": 2.5,
-        "allow_overnight": True
-    }
+    "MAX_PORTFOLIO_DRAWDOWN_PCT": 0.05,
+    "DAILY_CIRCUIT_BREAKER_LOSS_PCT": 0.04,
+    "MAX_POSITION_LOSS_PCT": 0.03,        # Broker-side bracket stop-loss (-3%)
+    "FALLBACK_POSITION_LOSS_PCT": 0.045,  # Engine safety backstop (-4.5% / 1.5x)
+    "TAKE_PROFIT_PCT": 0.06,              # Broker-side bracket take-profit (+6%)
+    "MIN_ALLOCATION_PCT": 0.80            # Require at least 80% deployment ($800 minimum)
 }
 
-PROCESSED_BARS = deque(maxlen=1000)
-DECISION_CACHE = {}
+PROCESSED_BARS: Dict[str, datetime.datetime] = {}
+SIGNAL_COOLDOWN_CACHE: Dict[str, datetime.datetime] = {}
 
 # =====================================================================
-# 2. CREWAI TOOLS, AGENTS & EMAIL REPORTING SYSTEM
-# =====================================================================
-openai_llm = LLM(
-    model="gpt-4o-mini",
-    temperature=0.2,
-    api_key=OPENAI_API_KEY
-)
-
-@tool("Fetch Market Data")
-def fetch_market_data(ticker_symbol: str) -> str:
-    """Fetches real-time price and market capitalization for a stock or crypto ticker."""
-    try:
-        ticker = yf.Ticker(ticker_symbol)
-        info = ticker.fast_info
-        return f"Ticker: {ticker_symbol} | Price: ${info.last_price:.2f} | Market Cap: ${info.market_cap:,}"
-    except Exception as e:
-        return f"Error fetching market data for {ticker_symbol}: {str(e)}"
-
-@tool("Fetch SEC Insider Activity")
-def fetch_sec_executive_trades(ticker_symbol: str) -> str:
-    """Retrieves recent Form 4 insider trading filings directly from SEC EDGAR."""
-    cik = SEC_CIK_MAP.get(ticker_symbol.upper())
-    if not cik:
-        return f"No SEC CIK mapping configured for {ticker_symbol}."
-    
-    headers = {'User-Agent': 'MarketResearchApp admin@marketresearch.com'}
-    url = f"https://data.sec.gov/submissions/CIK{cik}.json"
-    
-    try:
-        res = requests.get(url, headers=headers)
-        if res.status_code == 200:
-            data = res.json()
-            recent_filings = data['filings']['recent']
-            forms = recent_filings['form'][:10]
-            dates = recent_filings['filingDate'][:10]
-            
-            insider_activity = [
-                f"{form} on {date}" 
-                for form, date in zip(forms, dates) 
-                if form == '4'
-            ]
-            return f"Recent Form 4 Filings ({ticker_symbol}): {', '.join(insider_activity) if insider_activity else 'No recent Form 4 filings.'}"
-        return f"SEC Data stream unavailable (Status {res.status_code})."
-    except Exception as e:
-        return f"Could not retrieve SEC EDGAR data for {ticker_symbol}: {str(e)}"
-
-market_data_collector = Agent(
-    role="Market Data Collector",
-    goal="Gather raw stock and crypto metrics, market cap figures, insider filings, and momentum drivers.",
-    backstory=(
-        "An expert financial data researcher focused on pulling precise technical "
-        "and market metrics without hitting iteration limits."
-    ),
-    tools=[fetch_market_data, fetch_sec_executive_trades],
-    max_iter=50,
-    human_input=False,
-    verbose=True,
-    llm=openai_llm
-)
-
-portfolio_risk_analyst = Agent(
-    role="Portfolio Risk Analyst",
-    goal="Evaluate technical setups and generate structured market intelligence reports.",
-    backstory=(
-        "A seasoned quantitative risk analyst that evaluates trading setups and constructs "
-        "portfolio risk digests."
-    ),
-    tools=[],
-    max_iter=35,
-    human_input=False,
-    verbose=True,
-    llm=openai_llm
-)
-
-data_collection_task = Task(
-    description="Collect market cap data, recent executive Form 4 filings, and broader stock/crypto momentum drivers for active watchlists using tools.",
-    expected_output="A complete aggregated raw market data brief.",
-    agent=market_data_collector,
-)
-
-report_generation_task = Task(
-    description=(
-        "Generate a comprehensive daily investment intelligence report in clean HTML format.\n"
-        "Required Sections:\n"
-        "1. STOCKS PORTFOLIO (High/Medium/Low Risk across Cheap <$50, Medium $50-$200, High >$200)\n"
-        "2. CRYPTOCURRENCY PORTFOLIO (High/Medium/Low Risk across <$1, $1-$100, >$100)\n"
-        "3. INSIDER & EXECUTIVE ACTIVITY"
-    ),
-    expected_output="Valid HTML snippet with <h2>, <h3>, <ul>, <li>, and <strong> tags.",
-    agent=portfolio_risk_analyst,
-)
-
-def _run_crewai_report_task():
-    logging.info("[CREWAI THREAD] Running daily intelligence report generation...")
-    crew = Crew(
-        agents=[market_data_collector, portfolio_risk_analyst],
-        tasks=[data_collection_task, report_generation_task],
-        process=Process.sequential,
-        verbose=True
-    )
-    try:
-        result = crew.kickoff()
-        report_text = result.raw if hasattr(result, 'raw') else str(result)
-        send_daily_email(report_text)
-    except Exception as e:
-        logging.error(f"[REPORT ERROR] CrewAI generation failed: {e}")
-
-def generate_and_send_crewai_report_async():
-    report_thread = threading.Thread(target=_run_crewai_report_task, daemon=True)
-    report_thread.start()
-
-def send_daily_email(html_summary: str):
-    sender_email = (os.getenv("SENDER_EMAIL") or "").strip()
-    app_password = (os.getenv("SENDER_APP_PASSWORD") or "").strip()
-    recipient = (os.getenv("RECIPIENT_EMAIL") or "").strip()
-    
-    if not all([sender_email, app_password, recipient]):
-        logging.error("[EMAIL ERROR] Missing email credentials.")
-        return
-        
-    clean_content = str(html_summary).replace('\xa0', ' ')
-    email_html = f"<html><body>{clean_content}</body></html>"
-    
-    msg = EmailMessage()
-    msg['Subject'] = "12 PM Market Intel Report"
-    msg['From'] = sender_email
-    msg['To'] = recipient
-    msg.set_content("Your email reader does not support HTML.", charset='utf-8')
-    msg.add_alternative(email_html, subtype='html')
-    
-    try:
-        with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
-            server.login(sender_email, app_password)
-            server.send_message(msg)
-            logging.info("Formatted HTML email report successfully delivered!")
-    except Exception as e:
-        logging.error(f"[EMAIL ERROR] Failed to send email: {e}")
-
-# =====================================================================
-# 3. DATABASE & AUDIT LOGGERS
+# 2. DATABASE & LOGGING UTILITIES
 # =====================================================================
 def init_db():
     with sqlite3.connect(DB_FILE) as conn:
         cursor = conn.cursor()
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS llm_decisions (
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS audit_logs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT,
-                ticker TEXT,
-                asset_class TEXT,
-                action TEXT,
-                bearish_thesis TEXT,
-                confidence REAL,
-                executed INTEGER
+                timestamp TEXT NOT NULL,
+                ticker TEXT NOT NULL,
+                action TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                details TEXT
             )
-        ''')
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS broker_executions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT,
-                ticker TEXT,
-                side TEXT,
-                qty REAL,
-                price REAL,
-                stop_loss REAL,
-                take_profit REAL,
-                alpaca_order_id TEXT,
-                status TEXT
-            )
-        ''')
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS diagnostic_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT,
-                ticker TEXT,
-                stage TEXT,
-                detail TEXT
-            )
-        ''')
+        """)
         conn.commit()
 
 init_db()
 
-def log_diagnostic(ticker: str, stage: str, detail: str):
-    timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat()
-    if DEBUG_VERBOSE:
-        logging.info(f"[DIAG] {ticker} | {stage} | {detail}")
+def log_diagnostic(ticker: str, action: str, reason: str, details: str = ""):
+    now_str = datetime.datetime.now(EASTERN_TZ).strftime("%Y-%m-%d %H:%M:%S EST")
     try:
         with sqlite3.connect(DB_FILE) as conn:
-            conn.execute(
-                "INSERT INTO diagnostic_log (timestamp, ticker, stage, detail) VALUES (?, ?, ?, ?)",
-                (timestamp, ticker, stage, detail)
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO audit_logs (timestamp, ticker, action, reason, details) VALUES (?, ?, ?, ?, ?)",
+                (now_str, ticker, action, reason, details)
             )
             conn.commit()
     except Exception as e:
-        logging.error(f"[DIAG-LOG ERROR] Could not write diagnostic row: {e}")
-
-def log_decision(timestamp, ticker, asset_class, d, executed: int):
-    with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        cursor.execute('''
-            INSERT INTO llm_decisions (timestamp, ticker, asset_class, action, bearish_thesis, confidence, executed)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        ''', (timestamp, ticker, asset_class, d.action, d.bearish_thesis, d.confidence_score, executed))
-        conn.commit()
-
-def log_execution(timestamp, ticker, side, qty, price, stop_loss, take_profit, alpaca_order_id):
-    with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        cursor.execute('''
-            INSERT INTO broker_executions (timestamp, ticker, side, qty, price, stop_loss, take_profit, alpaca_order_id, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (timestamp, ticker, side, qty, price, stop_loss, take_profit, alpaca_order_id, "FILLED"))
-        conn.commit()
+        logging.error(f"[DB ERROR] Failed to log diagnostic: {e}")
+    if DEBUG_VERBOSE:
+        logging.info(f"[DIAGNOSTIC] [{ticker}] {action} | {reason} | {details}")
 
 # =====================================================================
-# 4. TECHNICAL GATEKEEPER
+# 3. PORTFOLIO & RISK HELPERS
 # =====================================================================
-class TechnicalGatekeeper:
-    @staticmethod
-    def get_asset_class(ticker: str) -> str:
-        return "CRYPTO_ADJACENT" if ticker.upper() in CRYPTO_ADJACENT_TICKERS else "STANDARD"
+def audit_portfolio_risk_state(active_positions: List[Any]):
+    try:
+        account = trading_client.get_account()
+        equity = float(account.equity)
+        last_equity = float(account.last_equity)
+        
+        portfolio_drawdown = (last_equity - equity) / last_equity if last_equity > 0 else 0
 
-    @staticmethod
-    def calculate_indicators(ticker: str, df_1m: pd.DataFrame, df_4h: pd.DataFrame) -> dict:
-        asset_class = TechnicalGatekeeper.get_asset_class(ticker)
-        params = RISK_PARAMS[asset_class]
-        
-        # 1. Macro Uptrend Check
-        df_4h['ema50'] = df_4h['close'].ewm(span=50, adjust=False).mean()
-        macro_uptrend = bool(df_4h['close'].iloc[-1] > df_4h['ema50'].iloc[-1])
-        
-        # 2. VWAP Check
-        v = df_1m['volume']
-        tp = (df_1m['high'] + df_1m['low'] + df_1m['close']) / 3
-        vwap = (tp * v).cumsum() / (v.cumsum() + 1e-9)
-        current_vwap = vwap.iloc[-1]
-        above_vwap = bool(df_1m['close'].iloc[-1] > current_vwap)
-        
-        # 3. RVOL Check
-        avg_volume = df_1m['volume'].tail(20).mean()
-        current_volume = df_1m['volume'].iloc[-1]
-        rvol = current_volume / avg_volume if avg_volume > 0 else 0.0
-        rvol_passed = bool(rvol >= params['min_rvol'])
-        
-        # ATR & Price Calculations
-        high_low = df_1m['high'] - df_1m['low']
-        high_close = np.abs(df_1m['high'] - df_1m['close'].shift())
-        low_close = np.abs(df_1m['low'] - df_1m['close'].shift())
-        tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-        atr = tr.rolling(14).mean().iloc[-1]
-        
-        current_price = float(df_1m['close'].iloc[-1])
-        recent_high = float(df_1m['high'].iloc[-4:-1].max())
-        
-        # 4. Breakout Check with 0.1% Buffer
-        breakout_threshold = recent_high * 0.999
-        is_breakout = bool(current_price >= breakout_threshold)
-        
-        # N-of-4 Scoring Gatekeeper
-        conditions_passed = sum([macro_uptrend, above_vwap, rvol_passed, is_breakout])
-        passed_filter = bool(conditions_passed >= 3)
-        
-        stop_loss = round(current_price - (params['sl_atr_mult'] * atr), 2)
-        take_profit = round(current_price + (params['sl_atr_mult'] * atr * params['rr_target']), 2)
-        
-        log_diagnostic(ticker, "FILTER", 
-            f"score={conditions_passed}/4 | passed={passed_filter} | "
-            f"macro={macro_uptrend} | vwap={above_vwap} (P:{round(current_price,2)} vs V:{round(current_vwap,2)}) | "
-            f"rvol={rvol_passed} ({round(rvol,2)}x) | breakout={is_breakout} (P:{round(current_price,2)} vs Thresh:{round(breakout_threshold,2)})"
-        )
-        
-        return {
-            "passed": passed_filter,
-            "score": conditions_passed,
-            "asset_class": asset_class,
-            "current_price": round(current_price, 2),
-            "vwap": round(current_vwap, 2),
-            "rvol": round(rvol, 2),
-            "atr": round(atr, 2),
-            "stop_loss": stop_loss,
-            "take_profit": take_profit,
-            "macro_uptrend": macro_uptrend,
-            "min_rvol_required": params['min_rvol']
-        }
+        if portfolio_drawdown >= RISK_PARAMS["DAILY_CIRCUIT_BREAKER_LOSS_PCT"] or \
+           portfolio_drawdown >= RISK_PARAMS["MAX_PORTFOLIO_DRAWDOWN_PCT"]:
+            logging.error(f"[CIRCUIT BREAKER] Drawdown {portfolio_drawdown:.2%} exceeds threshold. Liquidating portfolio!")
+            close_all_open_positions()
+            return
+
+        for pos in active_positions:
+            unrealized_plpc = float(pos.unrealized_plpc)
+            if unrealized_plpc <= -RISK_PARAMS["FALLBACK_POSITION_LOSS_PCT"]:
+                logging.warning(
+                    f"[FALLBACK RISK STOP] {pos.symbol} reached {unrealized_plpc:.2%} "
+                    f"(exceeded {RISK_PARAMS['FALLBACK_POSITION_LOSS_PCT']:.2%}). Closing directly."
+                )
+                trading_client.close_position(pos.symbol)
+    except Exception as e:
+        logging.error(f"[RISK AUDIT ERROR] Failed checking portfolio state: {e}")
+
+def close_all_open_positions():
+    try:
+        trading_client.cancel_orders()
+        trading_client.close_all_positions(cancel_orders=True)
+        logging.info("[LIQUIDATION COMPLETE] All orders canceled and positions closed.")
+    except Exception as e:
+        logging.error(f"[LIQUIDATION ERROR] Failed liquidating positions: {e}")
 
 # =====================================================================
-# 5. QUALITATIVE LLM RISK ADVERSARY
+# 4. MARKET DATA & TECHNICAL ANALYSIS
 # =====================================================================
-class TradeDecisionSchema(BaseModel):
-    action: Literal["BUY", "HOLD"] = Field(description="BUY if momentum conviction is pristine, else HOLD")
-    bearish_thesis: str = Field(description="3 concrete market structural failure risks")
-    confidence_score: float = Field(description="Score between 0.0 and 1.0 evaluating thesis strength")
-
-def run_llm_strategy_agent(ticker: str, metrics: dict, bypass_cache: bool = False) -> Optional[TradeDecisionSchema]:
-    now = time.time()
-    if not bypass_cache and ticker in DECISION_CACHE:
-        cached_decision, cached_time = DECISION_CACHE[ticker]
-        if now - cached_time < LLM_COOLDOWN_SECONDS:
-            log_diagnostic(ticker, "LLM_CACHE_HIT", f"returning cached decision from {int(now - cached_time)}s ago: "
-                                                    f"action={cached_decision.action} confidence={cached_decision.confidence_score}")
-            return cached_decision
-
-    prompt = (
-        f"Ticker: {ticker} ({metrics['asset_class']})\n"
-        f"Price: ${metrics['current_price']} | SL: ${metrics['stop_loss']} | TP: ${metrics['take_profit']}\n"
-        f"RVOL: {metrics['rvol']}x (Req: {metrics['min_rvol_required']}x)\n"
-        f"4H Trend: {'Strong Uptrend' if metrics['macro_uptrend'] else 'Downtrend'}\n"
-        f"Technical Score: {metrics['score']}/4 Conditions Passed\n"
-        "Evaluate breakout failure probability. Output action (BUY/HOLD), 3 failure reasons, and confidence score."
-    )
+def fetch_market_bars(ticker: str) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    start_utc = now_utc - datetime.timedelta(days=5)
 
     try:
-        completion = openai_client.beta.chat.completions.parse(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "You are a disciplined risk control agent. Veto unsafe entries."},
-                {"role": "user", "content": prompt}
-            ],
-            response_format=TradeDecisionSchema,
-            temperature=0.0
+        request = StockBarsRequest(
+            symbol_or_symbols=ticker,
+            timeframe=TimeFrame.Minute,
+            start=start_utc,
+            end=now_utc,
+            feed=DataFeed.IEX
         )
-        decision = completion.choices[0].message.parsed
-        DECISION_CACHE[ticker] = (decision, now)
-        log_diagnostic(ticker, "LLM_DECISION", f"action={decision.action} confidence={decision.confidence_score} "
-                                                f"(need action=BUY and confidence>=0.50) thesis={decision.bearish_thesis[:120]}")
-        return decision
+        bars_1m = data_client.get_stock_bars(request).df
+        if isinstance(bars_1m.index, pd.MultiIndex):
+            bars_1m = bars_1m.xs(ticker)
     except Exception as e:
-        log_diagnostic(ticker, "LLM_ERROR", str(e))
-        logging.error(f"[ERROR] LLM Query Failed for {ticker}: {e}")
-        return None
+        logging.error(f"[{ticker}] Failed fetching 1m bars via Alpaca (IEX): {e}")
+        bars_1m = None
 
-# =====================================================================
-# 6. EXECUTION PIPELINE & BROKER INTERACTIONS
-# =====================================================================
-def place_alpaca_order(symbol: str, target_dollar_amount: float = DEFAULT_DOLLAR_ALLOCATION) -> Optional[str]:
-    """Submits a fixed-dollar fractional market order with time_in_force='day' using Alpaca SDK."""
     try:
-        order_data = MarketOrderRequest(
-            symbol=symbol,
-            notional=target_dollar_amount,
-            side=OrderSide.BUY,
-            time_in_force=TimeInForce.DAY
-        )
-        order = trading_client.submit_order(order_data)
-        logging.info(f"🚀 [EXECUTION TRIGGERED] ${target_dollar_amount:.2f} allocated to {symbol} | Order ID: {order.id}")
-        return str(order.id)
+        ticker_obj = yf.Ticker(ticker)
+        df_4h = ticker_obj.history(period="10d", interval="60m")
+        if not df_4h.empty:
+            df_4h = df_4h.resample("4h").agg({
+                'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'
+            }).dropna()
+        else:
+            df_4h = None
     except Exception as e:
-        log_diagnostic(symbol, "ORDER_ERROR", str(e))
-        logging.error(f"Alpaca Order Execution Failed for {symbol}: {e}")
-        return None
+        logging.error(f"[{ticker}] Failed fetching 4h bars via yfinance: {e}")
+        df_4h = None
 
-def evaluate_and_process_ticker(ticker: str, metrics: dict):
-    score = metrics.get("score", 0)
-    timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat()
-    est_qty = round(DEFAULT_DOLLAR_ALLOCATION / metrics['current_price'], 4) if metrics['current_price'] > 0 else 0
-
-    # PATH A: AUTO-EXECUTE HIGH TECHNICAL SETUPS (Score 3/4 or 4/4)
-    if score >= 3:
-        logging.info(f"🚀 [{ticker}] High Technical Setup Triggered ({score}/4)! Bypassing LLM Adversary...")
-        order_id = place_alpaca_order(ticker, DEFAULT_DOLLAR_ALLOCATION)
-        if order_id:
-            log_execution(timestamp, ticker, "BUY", est_qty, metrics['current_price'], metrics['stop_loss'], metrics['take_profit'], order_id)
-        return
-
-    # PATH B: AMBIGUOUS SETUPS (Score < 3) - RUN LLM ADVERSARY
-    logging.info(f"[{ticker}] Technical score {score}/4 below auto-buy threshold. Running LLM Adversary...")
-    decision = run_llm_strategy_agent(ticker, metrics, bypass_cache=True)
-    if not decision:
-        log_diagnostic(ticker, "SKIP", "LLM returned no decision")
-        return
-
-    executed = 0
-    if decision.action == "BUY" and decision.confidence_score >= 0.50:
-        logging.info(f"[{ticker}] LLM Approved ({decision.action} @ {decision.confidence_score} confidence)")
-        order_id = place_alpaca_order(ticker, DEFAULT_DOLLAR_ALLOCATION)
-        if order_id:
-            executed = 1
-            log_execution(timestamp, ticker, "BUY", est_qty, metrics['current_price'], metrics['stop_loss'], metrics['take_profit'], order_id)
-    else:
-        logging.info(f"[DIAG] {ticker} | SKIP | LLM did not clear bar: action={decision.action} confidence={decision.confidence_score}")
-    
-    log_decision(timestamp, ticker, metrics['asset_class'], decision, executed)
-
-def process_pipeline(ticker: str, df_1m: pd.DataFrame, df_4h: pd.DataFrame):
-    current_time_est = datetime.datetime.now(EASTERN_TZ).time()
-    if current_time_est >= datetime.time(15, 45):
-        log_diagnostic(ticker, "SKIP", f"past 15:45 EST cutoff ({current_time_est})")
-        return
-
-    bar_time = df_1m.index[-1]
-    bar_id = f"{ticker}_{bar_time}"
-    if bar_id in PROCESSED_BARS:
-        log_diagnostic(ticker, "SKIP", f"bar {bar_time} already processed")
-        return
-
-    metrics = TechnicalGatekeeper.calculate_indicators(ticker, df_1m, df_4h)
-    PROCESSED_BARS.append(bar_id)
-    evaluate_and_process_ticker(ticker, metrics)
-
-def fetch_market_bars(ticker: str):
-    now = datetime.datetime.now(datetime.timezone.utc)
-    start_1m = now - datetime.timedelta(days=2)
-    start_4h = now - datetime.timedelta(days=30)
-    
-    request_1m = StockBarsRequest(
-        symbol_or_symbols=ticker,
-        timeframe=TimeFrame.Minute,
-        start=start_1m,
-        feed=DataFeed.IEX
-    )
-    request_4h = StockBarsRequest(
-        symbol_or_symbols=ticker,
-        timeframe=TimeFrame.Hour,
-        start=start_4h,
-        feed=DataFeed.IEX
-    )
-    
-    bars_1m = data_client.get_stock_bars(request_1m).df
-    bars_4h = data_client.get_stock_bars(request_4h).df
-    
-    if bars_1m.empty or bars_4h.empty:
-        log_diagnostic(ticker, "DATA_EMPTY", f"1m rows={len(bars_1m)} 4h rows={len(bars_4h)}")
-        return None, None
-        
-    if isinstance(bars_1m.index, pd.MultiIndex):
-        bars_1m = bars_1m.xs(ticker)
-    if isinstance(bars_4h.index, pd.MultiIndex):
-        bars_4h = bars_4h.xs(ticker)
-        
-    df_4h = bars_4h.resample('4h').agg({
-        'open': 'first',
-        'high': 'max',
-        'low': 'min',
-        'close': 'last',
-        'volume': 'sum'
-    }).dropna()
-    
     return bars_1m, df_4h
 
-# =====================================================================
-# 7. UNIFIED MAIN LOOP
-# =====================================================================
-def run_trading_cycle():
-    now_est = datetime.datetime.now(EASTERN_TZ)
-    logging.info(f"Starting Market Execution Cycle [{now_est.strftime('%Y-%m-%d %H:%M:%S EST')}]...")
+def analyze_indicators(df_1m: pd.DataFrame, df_4h: pd.DataFrame) -> Dict[str, Any]:
+    close_1m = df_1m['close'] if 'close' in df_1m.columns else df_1m['Close']
+    vol_1m = df_1m['volume'] if 'volume' in df_1m.columns else df_1m['Volume']
+    
+    rsi_1m = ta.momentum.rsi(close_1m, window=14).iloc[-1]
+    
+    # Pure trailing baseline: shift(1) excludes the current bar from its own SMA calculation
+    vol_sma20 = vol_1m.shift(1).rolling(20).mean().iloc[-1]
+    vol_spike = vol_1m.iloc[-1] > (1.2 * vol_sma20) if pd.notna(vol_sma20) and vol_sma20 > 0 else False
+    
+    close_4h = df_4h['Close']
+    ema_20 = ta.trend.ema_indicator(close_4h, window=20).iloc[-1]
+    ema_50 = ta.trend.ema_indicator(close_4h, window=50).iloc[-1]
+    
+    return {
+        "rsi_1m": rsi_1m,
+        "vol_spike": vol_spike,
+        "trend_4h": "BULLISH" if ema_20 > ema_50 else "BEARISH",
+        "latest_price": close_1m.iloc[-1]
+    }
 
-    if now_est.hour == 12 and now_est.minute < 3:
+def process_pipeline(ticker: str, bars_1m: pd.DataFrame, df_4h: pd.DataFrame, active_positions: List[Any]):
+    latest_bar_time = bars_1m.index[-1]
+    if ticker in PROCESSED_BARS and PROCESSED_BARS[ticker] == latest_bar_time:
+        return
+    PROCESSED_BARS[ticker] = latest_bar_time
+
+    indicators = analyze_indicators(bars_1m, df_4h)
+    log_diagnostic(ticker, "SCAN", "Indicators Calculated", str(indicators))
+
+    pos_symbols = [p.symbol for p in active_positions]
+
+    if len(pos_symbols) >= MAX_OPEN_POSITIONS and ticker not in pos_symbols:
+        log_diagnostic(ticker, "SKIP", f"Max concurrent positions reached ({len(pos_symbols)}/{MAX_OPEN_POSITIONS})")
+        return
+
+    # Signal Check: RSI < 30 + Volume Spike + 4h Bullish Trend
+    if (indicators["rsi_1m"] < 30 and 
+        indicators["vol_spike"] and 
+        indicators["trend_4h"] == "BULLISH" and 
+        ticker not in pos_symbols):
+        
+        if ticker in SIGNAL_COOLDOWN_CACHE:
+            if (datetime.datetime.now(EASTERN_TZ) - SIGNAL_COOLDOWN_CACHE[ticker]).total_seconds() < ENTRY_COOLDOWN_SECONDS:
+                log_diagnostic(ticker, "SKIP", "Re-entry Cooldown Active")
+                return
+
+        latest_price = float(indicators["latest_price"])
+        qty = int(DEFAULT_DOLLAR_ALLOCATION // latest_price)
+        allocated_dollars = qty * latest_price
+        min_required_dollars = DEFAULT_DOLLAR_ALLOCATION * RISK_PARAMS["MIN_ALLOCATION_PCT"]
+
+        if qty < 1 or allocated_dollars < min_required_dollars:
+            log_diagnostic(ticker, "SKIP", f"Allocation efficiency low: ${allocated_dollars:.2f} < ${min_required_dollars:.2f}")
+            return
+
+        take_profit_price = round(latest_price * (1 + RISK_PARAMS["TAKE_PROFIT_PCT"]), 2)
+        stop_loss_price = round(latest_price * (1 - RISK_PARAMS["MAX_POSITION_LOSS_PCT"]), 2)
+
+        logging.info(f"[{ticker}] SIGNAL CONFIRMED: Submitting Bracket Order for {qty} shares.")
+        SIGNAL_COOLDOWN_CACHE[ticker] = datetime.datetime.now(EASTERN_TZ)
+        
         try:
-            generate_and_send_crewai_report_async()
+            order_data = MarketOrderRequest(
+                symbol=ticker,
+                qty=qty,
+                side=OrderSide.BUY,
+                time_in_force=TimeInForce.DAY,
+                order_class=OrderClass.BRACKET,
+                take_profit=TakeProfitRequest(limit_price=take_profit_price),
+                stop_loss=StopLossRequest(stop_price=stop_loss_price)
+            )
+            trading_client.submit_order(order_data)
+            log_diagnostic(ticker, "BUY_BRACKET_SUBMITTED", f"Qty: {qty} | TP: ${take_profit_price} | SL: ${stop_loss_price}")
         except Exception as e:
-            logging.error(f"[ERROR] CrewAI report task failed: {e}")
+            logging.error(f"[{ticker}] Bracket order execution failed: {e}")
+
+# =====================================================================
+# 5. UNIFIED MAIN LOOP
+# =====================================================================
+def run_trading_cycle() -> int:
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    now_est = datetime.datetime.now(EASTERN_TZ)
+
+    try:
+        active_positions = trading_client.get_all_positions()
+    except Exception as e:
+        logging.error(f"[PORTFOLIO FETCH ERROR] Failed fetching positions: {e}")
+        active_positions = []
+
+    audit_portfolio_risk_state(active_positions)
+
+    try:
+        clock = trading_client.get_clock()
+    except Exception as e:
+        logging.error(f"[CLOCK FETCH ERROR] Could not verify market status: {e}")
+        return 180
+
+    sleep_interval = 180
+
+    if clock.is_open:
+        time_to_close = (clock.next_close - now_utc).total_seconds()
+        if time_to_close <= 600:
+            sleep_interval = 30
+
+        if time_to_close <= 300:
+            if active_positions:
+                logging.info(f"[EOD LIQUIDATION] Liquidating positions before market close ({int(time_to_close)}s remaining)...")
+                close_all_open_positions()
+            return sleep_interval
+    else:
+        if active_positions:
+            logging.warning("⚠️ [WARN] Orphaned positions detected after hours. Liquidating...")
+            close_all_open_positions()
+
+        logging.info(f"[MARKET CLOSED] Next open: {clock.next_open}.")
+        return 180
+
+    logging.info(f"Starting Market Scan [{now_est.strftime('%Y-%m-%d %H:%M:%S EST')}].")
 
     for ticker in ALL_TICKERS:
         try:
             bars_1m, df_4h = fetch_market_bars(ticker)
             if bars_1m is not None and df_4h is not None:
-                process_pipeline(ticker, bars_1m, df_4h)
+                process_pipeline(ticker, bars_1m, df_4h, active_positions)
         except Exception as e:
             log_diagnostic(ticker, "FETCH_ERROR", f"{type(e).__name__}: {e}")
-            logging.error(f"[ERROR] Failed processing ticker {ticker}: {e}")
 
-    logging.info(f"Cycle complete [{now_est.strftime('%Y-%m-%d %H:%M:%S EST')}].")
+    return sleep_interval
 
 if __name__ == "__main__":
-    logging.info("[ENGINE V5] Continuous Local Trading Loop Active.")
+    logging.info("[ENGINE V5] Cleaned Continuous Loop Active.")
     while True:
         try:
-            run_trading_cycle()
+            next_sleep = run_trading_cycle()
         except Exception as e:
-            logging.error(f"[ERROR] Unexpected cycle failure: {e}")
-        logging.info("Sleeping 3 minutes until next market scan...")
-        time.sleep(180)
+            logging.error(f"[ERROR] Cycle failure: {e}")
+            next_sleep = 180
+            
+        time.sleep(next_sleep)
