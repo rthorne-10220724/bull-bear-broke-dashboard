@@ -131,25 +131,7 @@ data_client = StockHistoricalDataClient(
 
 DB_FILE = os.path.join(LOG_DIR, "trading_state.db")
 
-TARGETS = [
-    # Indices & Leveraged QQQ (4)
-    "SPY", "QQQ", "TQQQ", "SQQQ",
-    
-    # Technology & Semiconductors (7)
-    "AAPL", "NVDA", "MSFT", "AMZN", "GOOGL", "META", "AMD",
-    
-    # Healthcare & Biotech (5)
-    "UNH", "PFE", "LLY", "JNJ", "ABBV",
-    
-    # Defense & Aerospace (4)
-    "LMT", "RTX", "NOC", "GD",
-    
-    # Finance, Energy & Consumer Staples (4)
-    "JPM", "V", "XOM", "PG",
-    
-    # Crypto Assets (4)
-    "BTC/USD", "ETH/USD", "SOL/USD", "AVAX/USD"
-]
+TARGETS = ["SPY", "QQQ", "TQQQ", "SQQQ"]
 
 MAX_OPEN_POSITIONS = 3
 MAX_TOTAL_ACTIVE_TRADES = 3
@@ -1519,35 +1501,8 @@ def run_cycle():
             )
 
         else:
-            # For standard equities and crypto, use SPY's 4H trend context as the market baseline
-            df_1m = fetch_1m_bars(
-                ticker,
-                limit=120,
-            )
 
-            if (
-                df_1m is None
-                or len(df_1m) < 50
-            ):
-
-                logger.warning(
-                    f"[{ticker}] Insufficient data."
-                )
-
-                continue
-
-            indicators = analyze_indicators(
-                df_1m,
-                spy_4h,
-            )
-
-            indicators["trend_4h"] = (
-                spy_indicators["trend_4h"]
-            )
-
-            valid, reasons = bullish_signal(
-                indicators
-            )
+            continue
 
         logger.info(
             f"[{ticker}] "
@@ -1626,7 +1581,6 @@ def run_cycle():
 # =====================================================================
 # 14. MAIN
 # =====================================================================
-
 def main():
 
     init_db()
