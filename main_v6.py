@@ -95,3 +95,90 @@ def log_decision(msg: str):
 # =====================================================================
 # 2. CONFIGURATION & CREDENTIALS
 # =====================================================================
+
+API_KEY = os.getenv("APCA_API_KEY_ID")
+API_SECRET = os.getenv("APCA_API_SECRET_KEY")
+BASE_URL = os.getenv("APCA_API_BASE_URL", "https://paper-api.alpaca.markets")
+
+USE_PAPER = True
+if "live" in BASE_URL.lower():
+    USE_PAPER = False
+
+WATCHLIST = [
+    "AAPL", "MSFT", "NVDA", "TSLA", "AMZN", "GOOGL", "META", "SPY", "QQQ", "SQQQ"
+]
+
+# =====================================================================
+# 3. DATABASE INITIALIZATION
+# =====================================================================
+
+DB_NAME = "trading_engine.db"
+
+def init_db():
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT,
+            side TEXT,
+            qty REAL,
+            price REAL,
+            order_id TEXT,
+            status TEXT,
+            timestamp TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+# =====================================================================
+# 4. CORE TRADING ENGINE
+# =====================================================================
+
+class TradingEngine:
+    def __init__(self):
+        logger.info("Initializing Bull. Bear and Broke Engine V6...")
+        init_db()
+        
+        if not API_KEY or not API_SECRET:
+            logger.error("Alpaca API credentials missing from environment variables!")
+            sys.exit(1)
+            
+        self.trading_client = TradingClient(API_KEY, API_SECRET, paper=USE_PAPER)
+        self.data_client = StockHistoricalDataClient(API_KEY, API_SECRET)
+        
+    def check_account(self):
+        try:
+            account = self.trading_client.get_account()
+            logger.info(f"Account Status: {account.status} | Cash: ${account.cash} | Portfolio Value: ${account.portfolio_value}")
+        except Exception as e:
+            logger.error(f"Failed to fetch account details: {e}")
+
+    def run_strategy_loop(self):
+        logger.info("Starting main execution loop...")
+        while True:
+            try:
+                self.check_account()
+                
+                # Placeholder for indicator checks and execution logic
+                for symbol in WATCHLIST:
+                    logger.debug(f"Scanning symbol: {symbol}")
+                
+                # Sleep interval between scanning cycles (e.g., 3 minutes)
+                time.sleep(180)
+                
+            except KeyboardInterrupt:
+                logger.info("Engine stopped manually by user.")
+                break
+            except Exception as e:
+                logger.error(f"Error in main strategy loop: {e}")
+                time.sleep(30)
+
+# =====================================================================
+# 5. ENTRYPOINT
+# =====================================================================
+
+if __name__ == "__main__":
+    engine = TradingEngine()
+    engine.run_strategy_loop()
