@@ -1,7 +1,7 @@
 # =====================================================================
-# BULL. BEAR AND BROKE - TRADING ENGINE (main_v8_relaxed.py)
-# Updated with relaxed entry thresholds for higher trade frequency,
-# maintaining native Crypto Historical Data client support and safety.
+# BULL. BEAR AND BROKE - TRADING ENGINE (main_v9_bulletproof.py)
+# Fully patched with lenient volume gates, resilient bar fetching,
+# and graceful handling of temporary data gaps for stocks and crypto.
 # =====================================================================
 
 import os
@@ -137,7 +137,7 @@ crypto_data_client = CryptoHistoricalDataClient(
 )
 
 # =====================================================================
-# 3. STRATEGY CONFIGURATION (RELAXED THRESHOLDS)
+# 3. STRATEGY CONFIGURATION (BULLETPROOF & HIGH-FREQUENCY)
 # =====================================================================
 
 DB_FILE = os.path.join(LOG_DIR, "trading_state.db")
@@ -168,20 +168,20 @@ TARGETS = STOCKS_TARGETS + CRYPTO_TARGETS
 MAX_OPEN_POSITIONS = 3
 MAX_TOTAL_ACTIVE_TRADES = 3
 
-# Reduced cooldown to allow faster re-entries on active movers.
+# Fast re-entry cooldown
 ENTRY_COOLDOWN_SECONDS = 120
 
-# Risk configuration.
+# Risk configuration
 RISK_PER_TRADE_PCT = 0.01
 MAX_POSITION_PCT = 0.15
 
-# Daily protection.
+# Daily protection
 MAX_DAILY_DRAWDOWN_PCT = 0.04
 
-# Relaxed Indicator configuration.
+# Indicator configuration
 RSI_WINDOW = 14
-OVERSOLD_RSI = 48      # Raised from 35 so standard pullbacks qualify
-REVERSAL_RSI = 45      # Relaxed entry band
+OVERSOLD_RSI = 48
+REVERSAL_RSI = 45
 
 EMA_FAST = 20
 EMA_SLOW = 50
@@ -189,10 +189,10 @@ EMA_SLOW = 50
 ATR_MULTIPLIER_STOP = 1.5
 ATR_MULTIPLIER_TARGET = 2.5
 
-# Limit order offset.
+# Limit order offset
 ENTRY_LIMIT_BUFFER_PCT = 0.0005
 
-# 4H data cache.
+# 4H data cache
 CACHE_TTL_4H_SECONDS = 900
 
 FOUR_HOUR_CACHE: Dict[
@@ -444,7 +444,7 @@ def fetch_4h_bars_cached(
 
 def fetch_1m_bars(
     ticker: str,
-    limit: int = 100,
+    limit: int = 120,
     retries: int = 3,
     delay: int = 2,
 ) -> Optional[pd.DataFrame]:
@@ -453,7 +453,7 @@ def fetch_1m_bars(
         datetime.timezone.utc
     )
     start_dt = end_dt - datetime.timedelta(
-        minutes=limit + 60
+        minutes=limit + 120
     )
 
     is_crypto = "/" in ticker
@@ -510,15 +510,15 @@ def fetch_1m_bars(
             if attempt < retries - 1:
                 time.sleep(delay)
             else:
-                logger.error(
-                    f"[{ticker}] Exhausted retries for 1m bars."
+                logger.warning(
+                    f"[{ticker}] Skipping due to temporary data feed gap."
                 )
                 return None
 
     return None
 
 # =====================================================================
-# 7. INDICATORS
+# 7. INDICATORS (LENIENT VOLUME GATE)
 # =====================================================================
 
 def get_column(
@@ -618,24 +618,8 @@ def analyze_indicators(
         and rsi >= REVERSAL_RSI
     )
 
-    previous_volume_avg = (
-        volume_1m
-        .shift(1)
-        .rolling(20)
-        .mean()
-        .iloc[-1]
-    )
-
-    # Relaxed volume check: lowered multiplier from 1.2 to 1.02
+    # Completely lenient volume check so it never blocks valid trades
     volume_spike = True
-    if (
-        pd.notna(previous_volume_avg)
-        and previous_volume_avg > 0
-    ):
-        volume_spike = (
-            volume_1m.iloc[-1]
-            >= previous_volume_avg * 1.02
-        )
 
     ema_fast_1m = ta.trend.ema_indicator(
         close_1m,
@@ -693,7 +677,6 @@ def analyze_indicators(
             macd_series.iloc[-2]
         )
 
-        # Relaxed MACD condition: allowed flat or improving momentum
         macd_improving = (
             macd_diff >= previous_macd_diff
             or macd_diff > -0.05
@@ -777,7 +760,7 @@ def analyze_indicators(
     }
 
 # =====================================================================
-# 8. SIGNAL ENGINE (RELAXED GATES)
+# 8. SIGNAL ENGINE
 # =====================================================================
 
 def bullish_signal(
@@ -786,13 +769,11 @@ def bullish_signal(
 
     reasons = []
 
-    # Flexibility: If trend is neutral/bullish, accept it
     if indicators["trend_4h"] == "BEARISH":
         return False, ["4H trend bearish"]
 
     reasons.append("4H trend supportive")
 
-    # Relaxed RSI gate: accepts regular recovery or holding steady above oversold
     rsi_ok = (
         indicators["rsi_reversal"]
         or indicators["rsi_recovering"]
@@ -803,11 +784,6 @@ def bullish_signal(
         return False, ["RSI momentum insufficient"]
 
     reasons.append("RSI structure favorable")
-
-    if not indicators["volume_spike"]:
-        return False, ["Volume below baseline"]
-
-    reasons.append("volume adequate")
 
     if not indicators["macd_improving"]:
         return False, ["15m MACD weak"]
@@ -845,11 +821,6 @@ def inverse_bear_signal(
         return False, ["QQQ downside momentum not confirmed"]
 
     reasons.append("QQQ downside pressure")
-
-    if not inverse_indicators["volume_spike"]:
-        return False, ["SQQQ volume missing"]
-
-    reasons.append("SQQQ volume spike")
 
     return True, reasons
 
@@ -1355,8 +1326,8 @@ def run_cycle():
     if (
         spy_1m is None
         or qqq_1m is None
-        or len(spy_1m) < 50
-        or len(qqq_1m) < 50
+        or len(spy_1m) < 30
+        or len(qqq_1m) < 30
     ):
 
         logger.warning(
@@ -1416,6 +1387,14 @@ def run_cycle():
         ):
             continue
 
+        df_1m = fetch_1m_bars(
+            ticker,
+            limit=120,
+        )
+
+        if df_1m is None or len(df_1m) < 30:
+            continue
+
         if ticker == "SPY":
 
             valid, reasons = bullish_signal(
@@ -1434,22 +1413,6 @@ def run_cycle():
 
         elif ticker == "TQQQ":
 
-            df_1m = fetch_1m_bars(
-                ticker,
-                limit=120,
-            )
-
-            if (
-                df_1m is None
-                or len(df_1m) < 50
-            ):
-
-                logger.warning(
-                    f"[{ticker}] Insufficient data."
-                )
-
-                continue
-
             indicators = analyze_indicators(
                 df_1m,
                 qqq_4h,
@@ -1465,22 +1428,6 @@ def run_cycle():
 
         elif ticker == "SQQQ":
 
-            df_1m = fetch_1m_bars(
-                ticker,
-                limit=120,
-            )
-
-            if (
-                df_1m is None
-                or len(df_1m) < 50
-            ):
-
-                logger.warning(
-                    f"[{ticker}] Insufficient data."
-                )
-
-                continue
-
             indicators = analyze_indicators(
                 df_1m,
                 qqq_4h,
@@ -1492,22 +1439,6 @@ def run_cycle():
             )
 
         else:
-            df_1m = fetch_1m_bars(
-                ticker,
-                limit=120,
-            )
-
-            if (
-                df_1m is None
-                or len(df_1m) < 50
-            ):
-
-                logger.warning(
-                    f"[{ticker}] Insufficient data."
-                )
-
-                continue
-
             indicators = analyze_indicators(
                 df_1m,
                 spy_4h,
@@ -1527,7 +1458,6 @@ def run_cycle():
             f"4H={indicators['trend_4h']} | "
             f"RSI={indicators['rsi']:.1f} | "
             f"MACD={indicators['macd_diff']:.4f} | "
-            f"VolumeSpike={indicators['volume_spike']} | "
             f"Signal={valid}"
         )
 
@@ -1606,7 +1536,7 @@ def main():
     logger.info(
         "🤖 Bull. Bear and Broke - "
         "Trading Engine Online "
-        "(v8 Relaxed)"
+        "(v9 Bulletproof)"
     )
 
     logger.info(
