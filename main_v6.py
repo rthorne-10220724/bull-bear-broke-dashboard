@@ -1,7 +1,7 @@
 # =====================================================================
-# BULL. BEAR AND BROKE - TRADING ENGINE (main_v6.py)
-# Stronger signal confirmation, duplicate protection, cooldowns,
-# corrected SQQQ logic, and safer execution controls.
+# BULL. BEAR AND BROKE - TRADING ENGINE (main_v8_relaxed.py)
+# Updated with relaxed entry thresholds for higher trade frequency,
+# maintaining native Crypto Historical Data client support and safety.
 # =====================================================================
 
 import os
@@ -33,8 +33,14 @@ from alpaca.trading.enums import (
     OrderClass,
     QueryOrderStatus,
 )
-from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockBarsRequest
+from alpaca.data.historical import (
+    StockHistoricalDataClient,
+    CryptoHistoricalDataClient,
+)
+from alpaca.data.requests import (
+    StockBarsRequest,
+    CryptoBarsRequest,
+)
 from alpaca.data.timeframe import TimeFrame
 from alpaca.data.enums import DataFeed
 
@@ -120,24 +126,50 @@ trading_client = TradingClient(
     paper=PAPER_TRADING,
 )
 
-data_client = StockHistoricalDataClient(
+stock_data_client = StockHistoricalDataClient(
+    api_key=ALPACA_API_KEY,
+    secret_key=ALPACA_SECRET_KEY,
+)
+
+crypto_data_client = CryptoHistoricalDataClient(
     api_key=ALPACA_API_KEY,
     secret_key=ALPACA_SECRET_KEY,
 )
 
 # =====================================================================
-# 3. STRATEGY CONFIGURATION
+# 3. STRATEGY CONFIGURATION (RELAXED THRESHOLDS)
 # =====================================================================
 
 DB_FILE = os.path.join(LOG_DIR, "trading_state.db")
 
-TARGETS = ["SPY", "QQQ", "TQQQ", "SQQQ"]
+STOCKS_TARGETS = [
+    # Indices & Leveraged QQQ (4)
+    "SPY", "QQQ", "TQQQ", "SQQQ",
+    
+    # Technology & Semiconductors (7)
+    "AAPL", "NVDA", "MSFT", "AMZN", "GOOGL", "META", "AMD",
+    
+    # Healthcare & Biotech (5)
+    "UNH", "PFE", "LLY", "JNJ", "ABBV",
+    
+    # Defense & Aerospace (4)
+    "LMT", "RTX", "NOC", "GD",
+    
+    # Finance, Energy & Consumer Staples (4)
+    "JPM", "V", "XOM", "PG",
+]
+
+CRYPTO_TARGETS = [
+    "BTC/USD", "ETH/USD", "SOL/USD", "AVAX/USD"
+]
+
+TARGETS = STOCKS_TARGETS + CRYPTO_TARGETS
 
 MAX_OPEN_POSITIONS = 3
 MAX_TOTAL_ACTIVE_TRADES = 3
 
-# Prevent repeated entries after an order submission.
-ENTRY_COOLDOWN_SECONDS = 300
+# Reduced cooldown to allow faster re-entries on active movers.
+ENTRY_COOLDOWN_SECONDS = 120
 
 # Risk configuration.
 RISK_PER_TRADE_PCT = 0.01
@@ -146,10 +178,10 @@ MAX_POSITION_PCT = 0.15
 # Daily protection.
 MAX_DAILY_DRAWDOWN_PCT = 0.04
 
-# Indicator configuration.
+# Relaxed Indicator configuration.
 RSI_WINDOW = 14
-OVERSOLD_RSI = 35
-REVERSAL_RSI = 40
+OVERSOLD_RSI = 48      # Raised from 35 so standard pullbacks qualify
+REVERSAL_RSI = 45      # Relaxed entry band
 
 EMA_FAST = 20
 EMA_SLOW = 50
@@ -237,7 +269,7 @@ def get_db_state(key: str) -> Optional[str]:
 def record_trade(
     symbol: str,
     side: str,
-    qty: int,
+    qty: float,
     entry_price: float,
     stop_loss: float,
     take_profit: float,
@@ -282,7 +314,8 @@ def record_trade(
 # =====================================================================
 
 def cooldown_key(symbol: str) -> str:
-    return f"last_entry_time:{symbol}"
+    clean_symbol = symbol.replace("/", "_")
+    return f"last_entry_time:{clean_symbol}"
 
 def is_symbol_on_cooldown(symbol: str) -> bool:
     value = get_db_state(cooldown_key(symbol))
@@ -321,7 +354,7 @@ def cooldown_remaining(symbol: str) -> int:
         return 0
 
 # =====================================================================
-# 6. MARKET DATA
+# 6. MARKET DATA (WITH RETRIES & ROUTING)
 # =====================================================================
 
 def fetch_4h_bars_cached(
@@ -412,56 +445,77 @@ def fetch_4h_bars_cached(
 def fetch_1m_bars(
     ticker: str,
     limit: int = 100,
+    retries: int = 3,
+    delay: int = 2,
 ) -> Optional[pd.DataFrame]:
 
-    try:
+    end_dt = datetime.datetime.now(
+        datetime.timezone.utc
+    )
+    start_dt = end_dt - datetime.timedelta(
+        minutes=limit + 60
+    )
 
-        end_dt = datetime.datetime.now(
-            datetime.timezone.utc
-        )
+    is_crypto = "/" in ticker
 
-        start_dt = end_dt - datetime.timedelta(
-            minutes=limit + 30
-        )
+    for attempt in range(retries):
+        try:
+            if is_crypto:
+                request_params = CryptoBarsRequest(
+                    symbol_or_symbols=ticker,
+                    timeframe=TimeFrame.Minute,
+                    start=start_dt,
+                    end=end_dt,
+                )
+                bars = crypto_data_client.get_crypto_bars(
+                    request_params
+                )
+            else:
+                request_params = StockBarsRequest(
+                    symbol_or_symbols=ticker,
+                    timeframe=TimeFrame.Minute,
+                    start=start_dt,
+                    end=end_dt,
+                    feed=DataFeed.IEX,
+                )
+                bars = stock_data_client.get_stock_bars(
+                    request_params
+                )
 
-        request_params = StockBarsRequest(
-            symbol_or_symbols=ticker,
-            timeframe=TimeFrame.Minute,
-            start=start_dt,
-            end=end_dt,
-            feed=DataFeed.IEX,
-        )
+            df = bars.df
 
-        bars = data_client.get_stock_bars(
-            request_params
-        )
+            if df.empty:
+                logger.warning(
+                    f"[{ticker}] No 1m bars returned (Attempt {attempt+1}/{retries})."
+                )
+                if attempt < retries - 1:
+                    time.sleep(delay)
+                    continue
+                return None
 
-        df = bars.df
+            if isinstance(df.index, pd.MultiIndex):
+                df = df.xs(
+                    ticker,
+                    level=0,
+                )
 
-        if df.empty:
+            df = df.sort_index()
+            return df.tail(limit)
+
+        except Exception as e:
             logger.warning(
-                f"[{ticker}] No 1m bars returned."
+                f"[{ticker}] Failed fetching 1m bars "
+                f"(Attempt {attempt+1}/{retries}): {e}"
             )
-            return None
+            if attempt < retries - 1:
+                time.sleep(delay)
+            else:
+                logger.error(
+                    f"[{ticker}] Exhausted retries for 1m bars."
+                )
+                return None
 
-        if isinstance(df.index, pd.MultiIndex):
-            df = df.xs(
-                ticker,
-                level=0,
-            )
-
-        df = df.sort_index()
-
-        return df.tail(limit)
-
-    except Exception as e:
-
-        logger.error(
-            f"[{ticker}] Failed fetching "
-            f"1m bars: {e}"
-        )
-
-        return None
+    return None
 
 # =====================================================================
 # 7. INDICATORS
@@ -572,15 +626,15 @@ def analyze_indicators(
         .iloc[-1]
     )
 
-    volume_spike = False
-
+    # Relaxed volume check: lowered multiplier from 1.2 to 1.02
+    volume_spike = True
     if (
         pd.notna(previous_volume_avg)
         and previous_volume_avg > 0
     ):
         volume_spike = (
             volume_1m.iloc[-1]
-            > previous_volume_avg * 1.2
+            >= previous_volume_avg * 1.02
         )
 
     ema_fast_1m = ta.trend.ema_indicator(
@@ -597,7 +651,7 @@ def analyze_indicators(
         close_1m.iloc[-1]
         > ema_fast_1m.iloc[-1]
         and ema_fast_1m.iloc[-1]
-        > ema_slow_1m.iloc[-1]
+        >= ema_slow_1m.iloc[-1]
     )
 
     recent_high = (
@@ -608,7 +662,7 @@ def analyze_indicators(
 
     breakout_confirmation = (
         close_1m.iloc[-1]
-        > recent_high
+        >= recent_high
     )
 
     close_15m = (
@@ -620,7 +674,7 @@ def analyze_indicators(
 
     macd_diff = 0.0
     previous_macd_diff = 0.0
-    macd_improving = False
+    macd_improving = True
 
     if len(close_15m) >= 35:
 
@@ -639,8 +693,10 @@ def analyze_indicators(
             macd_series.iloc[-2]
         )
 
+        # Relaxed MACD condition: allowed flat or improving momentum
         macd_improving = (
-            macd_diff > previous_macd_diff
+            macd_diff >= previous_macd_diff
+            or macd_diff > -0.05
         )
 
     df_15m = (
@@ -685,7 +741,7 @@ def analyze_indicators(
 
     trend_4h = (
         "BULLISH"
-        if ema_20_4h > ema_50_4h
+        if ema_20_4h >= ema_50_4h
         else "BEARISH"
     )
 
@@ -721,7 +777,7 @@ def analyze_indicators(
     }
 
 # =====================================================================
-# 8. SIGNAL ENGINE
+# 8. SIGNAL ENGINE (RELAXED GATES)
 # =====================================================================
 
 def bullish_signal(
@@ -730,44 +786,44 @@ def bullish_signal(
 
     reasons = []
 
-    if indicators["trend_4h"] != "BULLISH":
-        return False, ["4H trend not bullish"]
+    # Flexibility: If trend is neutral/bullish, accept it
+    if indicators["trend_4h"] == "BEARISH":
+        return False, ["4H trend bearish"]
 
-    if not (
+    reasons.append("4H trend supportive")
+
+    # Relaxed RSI gate: accepts regular recovery or holding steady above oversold
+    rsi_ok = (
         indicators["rsi_reversal"]
         or indicators["rsi_recovering"]
-    ):
-        return False, ["RSI reversal not confirmed"]
+        or indicators["rsi"] >= 45
+    )
 
-    reasons.append("RSI reversal confirmed")
+    if not rsi_ok:
+        return False, ["RSI momentum insufficient"]
+
+    reasons.append("RSI structure favorable")
 
     if not indicators["volume_spike"]:
-        return False, [
-            "Insufficient volume confirmation"
-        ]
+        return False, ["Volume below baseline"]
 
-    reasons.append("volume spike")
+    reasons.append("volume adequate")
 
     if not indicators["macd_improving"]:
-        return False, [
-            "15m MACD not improving"
-        ]
+        return False, ["15m MACD weak"]
 
-    reasons.append("MACD improving")
+    reasons.append("MACD acceptable")
 
     price_confirmation = (
         indicators["short_term_bullish"]
         or indicators["breakout_confirmation"]
+        or indicators["latest_price"] >= indicators.get("prev_close", 0)
     )
 
     if not price_confirmation:
-        return False, [
-            "No bullish price confirmation"
-        ]
+        return False, ["No price confirmation"]
 
-    reasons.append(
-        "price confirmation"
-    )
+    reasons.append("price confirmation")
 
     return True, reasons
 
@@ -778,94 +834,22 @@ def inverse_bear_signal(
 
     reasons = []
 
-    if (
-        underlying_indicators["trend_4h"]
-        != "BEARISH"
-    ):
-        return False, [
-            "QQQ 4H trend not bearish"
-        ]
+    if underlying_indicators["trend_4h"] == "BULLISH":
+        return False, ["QQQ 4H trend not bearish"]
 
-    reasons.append(
-        "QQQ 4H bearish"
-    )
+    reasons.append("QQQ 4H bearish or flat")
 
-    qqq_rsi_weak = (
-        underlying_indicators["rsi"] < 50
-        and underlying_indicators["rsi"]
-        < underlying_indicators["previous_rsi"]
-    )
+    qqq_rsi_weak = underlying_indicators["rsi"] < 55
 
-    qqq_macd_weakening = (
-        underlying_indicators["macd_diff"]
-        < underlying_indicators[
-            "previous_macd_diff"
-        ]
-    )
+    if not qqq_rsi_weak:
+        return False, ["QQQ downside momentum not confirmed"]
 
-    if not (
-        qqq_rsi_weak
-        or qqq_macd_weakening
-    ):
-        return False, [
-            "QQQ downside momentum not confirmed"
-        ]
+    reasons.append("QQQ downside pressure")
 
-    reasons.append(
-        "QQQ downside momentum"
-    )
+    if not inverse_indicators["volume_spike"]:
+        return False, ["SQQQ volume missing"]
 
-    if not (
-        inverse_indicators["rsi_reversal"]
-        or inverse_indicators[
-            "rsi_recovering"
-        ]
-    ):
-        return False, [
-            "SQQQ RSI recovery not confirmed"
-        ]
-
-    reasons.append(
-        "SQQQ RSI recovery"
-    )
-
-    if not inverse_indicators[
-        "volume_spike"
-    ]:
-        return False, [
-            "SQQQ volume confirmation missing"
-        ]
-
-    reasons.append(
-        "SQQQ volume spike"
-    )
-
-    if not inverse_indicators[
-        "macd_improving"
-    ]:
-        return False, [
-            "SQQQ MACD not improving"
-        ]
-
-    reasons.append(
-        "SQQQ MACD improving"
-    )
-
-    if not (
-        inverse_indicators[
-            "short_term_bullish"
-        ]
-        or inverse_indicators[
-            "breakout_confirmation"
-        ]
-    ):
-        return False, [
-            "SQQQ price confirmation missing"
-        ]
-
-    reasons.append(
-        "SQQQ price confirmation"
-    )
+    reasons.append("SQQQ volume spike")
 
     return True, reasons
 
@@ -960,14 +944,14 @@ def calculate_position_size(
     price: float,
     atr: float,
     risk_pct: float = RISK_PER_TRADE_PCT,
-) -> int:
+) -> float:
 
     if (
         equity <= 0
         or price <= 0
         or atr <= 0
     ):
-        return 0
+        return 0.0
 
     risk_dollar = equity * risk_pct
 
@@ -975,7 +959,7 @@ def calculate_position_size(
         ATR_MULTIPLIER_STOP * atr
     )
 
-    shares_by_risk = int(
+    shares_by_risk = (
         risk_dollar / stop_distance
     )
 
@@ -983,7 +967,7 @@ def calculate_position_size(
         equity * MAX_POSITION_PCT
     )
 
-    max_shares_by_cap = int(
+    max_shares_by_cap = (
         max_position_dollar / price
     )
 
@@ -992,7 +976,10 @@ def calculate_position_size(
         max_shares_by_cap,
     )
 
-    return max(0, shares)
+    if "/" in str(price):
+        return max(0.0, round(shares, 4))
+    
+    return float(max(0, int(shares)))
 
 # =====================================================================
 # 10. POSITION / ORDER PROTECTION
@@ -1104,7 +1091,7 @@ def calculate_buy_limit_price(
 
 def place_long_bracket_order(
     symbol: str,
-    qty: int,
+    qty: float,
     latest_price: float,
     atr: float,
 ) -> Optional[Any]:
@@ -1166,7 +1153,7 @@ def place_long_bracket_order(
             limit_price=entry_price,
             qty=qty,
             side=OrderSide.BUY,
-            time_in_force=TimeInForce.DAY,
+            time_in_force=TimeInForce.GTC if "/" in symbol else TimeInForce.DAY,
             order_class=OrderClass.BRACKET,
             stop_loss=StopLossRequest(
                 stop_price=stop_loss
@@ -1217,7 +1204,9 @@ def place_long_bracket_order(
 # 12. MARKET SESSION MANAGEMENT
 # =====================================================================
 
-def market_is_tradeable() -> bool:
+def market_is_tradeable(is_crypto: bool = False) -> bool:
+    if is_crypto:
+        return True
 
     try:
 
@@ -1226,7 +1215,7 @@ def market_is_tradeable() -> bool:
         if not clock.is_open:
 
             logger.info(
-                "Market is closed. Skipping cycle."
+                "Market is closed. Skipping stock cycle."
             )
 
             return False
@@ -1289,9 +1278,6 @@ def run_cycle():
             "Trading halted by circuit breaker."
         )
 
-        return
-
-    if not market_is_tradeable():
         return
 
     equity = get_account_equity()
@@ -1401,6 +1387,11 @@ def run_cycle():
 
     for ticker in TARGETS:
 
+        is_crypto_target = "/" in ticker
+
+        if not is_crypto_target and not market_is_tradeable(is_crypto=False):
+            continue
+
         active_symbols = (
             get_open_position_symbols()
             | get_pending_order_symbols()
@@ -1501,8 +1492,34 @@ def run_cycle():
             )
 
         else:
+            df_1m = fetch_1m_bars(
+                ticker,
+                limit=120,
+            )
 
-            continue
+            if (
+                df_1m is None
+                or len(df_1m) < 50
+            ):
+
+                logger.warning(
+                    f"[{ticker}] Insufficient data."
+                )
+
+                continue
+
+            indicators = analyze_indicators(
+                df_1m,
+                spy_4h,
+            )
+
+            indicators["trend_4h"] = (
+                spy_indicators["trend_4h"]
+            )
+
+            valid, reasons = bullish_signal(
+                indicators
+            )
 
         logger.info(
             f"[{ticker}] "
@@ -1581,6 +1598,7 @@ def run_cycle():
 # =====================================================================
 # 14. MAIN
 # =====================================================================
+
 def main():
 
     init_db()
@@ -1588,7 +1606,7 @@ def main():
     logger.info(
         "🤖 Bull. Bear and Broke - "
         "Trading Engine Online "
-        "(v6)"
+        "(v8 Relaxed)"
     )
 
     logger.info(
