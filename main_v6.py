@@ -1124,7 +1124,7 @@ def place_long_bracket_order(
             limit_price=entry_price,
             qty=qty,
             side=OrderSide.BUY,
-            time_in_force=TimeInForce.GTC if "/" in symbol else TimeInForce.DAY,
+            time_in_force=TimeInForce.GTC,
             order_class=OrderClass.BRACKET,
             stop_loss=StopLossRequest(
                 stop_price=stop_loss
