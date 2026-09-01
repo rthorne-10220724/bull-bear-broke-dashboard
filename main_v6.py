@@ -1,8 +1,6 @@
 # =====================================================================
-# BULL. BEAR AND BROKE - TRADING ENGINE (main_v9_bulletproof.py)
-# Fully patched with lenient volume gates, resilient bar fetching,
-# GTC time-in-force multi-day bracket legs, asymmetric 3.5:1 reward-to-risk,
-# and high-beta volatility/RVOL filtering.
+# # BULL. BEAR AND BROKE - TRADING ENGINE (main_v10_dynamic.py)
+# Dynamic Momentum Screener with Bulk Batch Processing & Smart Watchlists
 # =====================================================================
 
 import os
@@ -27,12 +25,15 @@ from alpaca.trading.requests import (
     TakeProfitRequest,
     StopLossRequest,
     GetOrdersRequest,
+    GetAssetsRequest,
 )
 from alpaca.trading.enums import (
     OrderSide,
     TimeInForce,
     OrderClass,
     QueryOrderStatus,
+    AssetStatus,
+    AssetExchange,
 )
 from alpaca.data.historical import (
     StockHistoricalDataClient,
@@ -41,6 +42,8 @@ from alpaca.data.historical import (
 from alpaca.data.requests import (
     StockBarsRequest,
     CryptoBarsRequest,
+    StockLatestBarRequest,
+    CryptoLatestBarRequest,
 )
 from alpaca.data.timeframe import TimeFrame
 from alpaca.data.enums import DataFeed
@@ -138,33 +141,15 @@ crypto_data_client = CryptoHistoricalDataClient(
 )
 
 # =====================================================================
-# 3. STRATEGY CONFIGURATION (BULLETPROOF & HIGH-FREQUENCY)
+# 3. STRATEGY CONFIGURATION (DYNAMIC MOMENTUM SCREENER)
 # =====================================================================
 
 DB_FILE = os.path.join(LOG_DIR, "trading_state.db")
 
-STOCKS_TARGETS = [
-    # Indices & Leveraged QQQ (4)
-    "SPY", "QQQ", "TQQQ", "SQQQ",
-    
-    # Technology & Semiconductors (7)
-    "AAPL", "NVDA", "MSFT", "AMZN", "GOOGL", "META", "AMD",
-    
-    # Healthcare & Biotech (5)
-    "UNH", "PFE", "LLY", "JNJ", "ABBV",
-    
-    # Defense & Aerospace (4)
-    "LMT", "RTX", "NOC", "GD",
-    
-    # Finance, Energy & Consumer Staples (4)
-    "JPM", "V", "XOM", "PG",
-]
-
+# Core liquid crypto pairs always kept on watch for fast momentum
 CRYPTO_TARGETS = [
-    "BTC/USD", "ETH/USD", "SOL/USD", "AVAX/USD"
+    "BTC/USD", "ETH/USD", "SOL/USD", "AVAX/USD", "DOGE/USD"
 ]
-
-TARGETS = STOCKS_TARGETS + CRYPTO_TARGETS
 
 MAX_OPEN_POSITIONS = 3
 MAX_TOTAL_ACTIVE_TRADES = 3
@@ -356,7 +341,49 @@ def cooldown_remaining(symbol: str) -> int:
         return 0
 
 # =====================================================================
-# 6. MARKET DATA (WITH RETRIES & ROUTING)
+# 6. DYNAMIC MOMENTUM SCREENER & WATCHLIST GENERATOR
+# =====================================================================
+
+def get_dynamic_momentum_watchlist(max_stocks: int = 15) -> List[str]:
+    """
+    Dynamically scans a pool of candidate small/mid-cap high-beta equities
+    and high-momentum crypto targets using bulk latest bar requests to avoid rate limits.
+    """
+    # Curated pool of high-beta / small-mid cap symbols prone to momentum moves
+    candidate_stocks = [
+        "PLTR", "SOFI", "NIO", "MARA", "RIOT", "HOOD", 
+        "RIVN", "SNAP", "AMC", "GME", "PTON", "AAL",
+        "SPY", "QQQ", "AMD", "COIN", "DKNG", "UBER"
+    ]
+    
+    scored_targets = []
+    
+    try:
+        # Bulk fetch latest bars in a single request (zero rate-limit penalty)
+        request_params = StockLatestBarRequest(symbol_or_symbols=candidate_stocks)
+        latest_bars = stock_data_client.get_stock_latest_bar(request_params)
+        
+        for symbol, bar in latest_bars.items():
+            if bar and bar.open > 0:
+                # Calculate intraday return percentage
+                price_change_pct = (bar.close - bar.open) / bar.open * 100
+                scored_targets.append((symbol, price_change_pct))
+                
+        # Sort by strongest upside price momentum
+        scored_targets.sort(key=lambda x: x[1], reverse=True)
+        
+        # Take the top performing stocks
+        top_stocks = [item[0] for item in scored_targets[:max_stocks]]
+        
+        logger.info(f"[SCREENER] Dynamic watchlist updated with top active movers: {top_stocks}")
+        return top_stocks + CRYPTO_TARGETS
+        
+    except Exception as e:
+        logger.warning(f"[SCREENER] Failed dynamic stock scan: {e}. Falling back to default list.")
+        return ["PLTR", "SOFI", "MARA", "RIOT", "SPY", "QQQ"] + CRYPTO_TARGETS
+
+# =====================================================================
+# 7. MARKET DATA (WITH RETRIES & ROUTING)
 # =====================================================================
 
 def fetch_4h_bars_cached(
@@ -415,13 +442,6 @@ def fetch_4h_bars_cached(
             )
             return None
 
-        logger.debug(
-            f"[4H_FETCH] {ticker} "
-            f"bars={len(df_4h)} "
-            f"first={df_4h.index[0]} "
-            f"last={df_4h.index[-1]}"
-        )
-
         FOUR_HOUR_CACHE[ticker] = (
             df_4h,
             now_utc,
@@ -430,16 +450,9 @@ def fetch_4h_bars_cached(
         return df_4h
 
     except Exception as e:
-
-        logger.error(
-            f"[{ticker}] Failed fetching "
-            f"4H bars: {e}"
-        )
+        logger.error(f"[{ticker}] Failed fetching 4H bars: {e}")
 
     if ticker in FOUR_HOUR_CACHE:
-        logger.warning(
-            f"[{ticker}] Using stale 4H cache."
-        )
         return FOUR_HOUR_CACHE[ticker][0]
 
     return None
@@ -487,9 +500,6 @@ def fetch_1m_bars(
             df = bars.df
 
             if df.empty:
-                logger.warning(
-                    f"[{ticker}] No 1m bars returned (Attempt {attempt+1}/{retries})."
-                )
                 if attempt < retries - 1:
                     time.sleep(delay)
                     continue
@@ -505,22 +515,15 @@ def fetch_1m_bars(
             return df.tail(limit)
 
         except Exception as e:
-            logger.warning(
-                f"[{ticker}] Failed fetching 1m bars "
-                f"(Attempt {attempt+1}/{retries}): {e}"
-            )
             if attempt < retries - 1:
                 time.sleep(delay)
             else:
-                logger.warning(
-                    f"[{ticker}] Skipping due to temporary data feed gap."
-                )
                 return None
 
     return None
 
 # =====================================================================
-# 7. INDICATORS, VOLATILITY & RVOL FILTERS
+# 8. INDICATORS, VOLATILITY & RVOL FILTERS
 # =====================================================================
 
 def get_column(
@@ -589,45 +592,19 @@ def passes_volatility_filter(df_1m: pd.DataFrame) -> bool:
         else:
             rvol = current_vol / avg_vol
 
-        return atr_percentage >= 1.5 and rvol >= 0.8
+        return atr_percentage >= 1.0 and rvol >= 0.7
     except Exception as e:
         logger.warning(f"Volatility filter check failed: {e}")
         return True
 
 def analyze_indicators(
     df_1m: pd.DataFrame,
-    df_4h: pd.DataFrame,
+    df_4h: Optional[pd.DataFrame] = None,
 ) -> Dict[str, Any]:
 
-    close_1m = get_column(
-        df_1m,
-        "close",
-        "Close",
-    )
-
-    high_1m = get_column(
-        df_1m,
-        "high",
-        "High",
-    )
-
-    low_1m = get_column(
-        df_1m,
-        "low",
-        "Low",
-    )
-
-    open_1m = get_column(
-        df_1m,
-        "open",
-        "Open",
-    )
-
-    volume_1m = get_column(
-        df_1m,
-        "volume",
-        "Volume",
-    )
+    close_1m = get_column(df_1m, "close", "Close")
+    high_1m = get_column(df_1m, "high", "High")
+    low_1m = get_column(df_1m, "low", "Low")
 
     rsi_series = ta.momentum.rsi(
         close_1m,
@@ -685,26 +662,17 @@ def analyze_indicators(
     )
 
     macd_diff = 0.0
-    previous_macd_diff = 0.0
     macd_improving = True
 
     if len(close_15m) >= 35:
-
         macd_series = ta.trend.macd_diff(
             close_15m,
             window_slow=26,
             window_fast=12,
             window_sign=9,
         )
-
-        macd_diff = float(
-            macd_series.iloc[-1]
-        )
-
-        previous_macd_diff = float(
-            macd_series.iloc[-2]
-        )
-
+        macd_diff = float(macd_series.iloc[-1])
+        previous_macd_diff = float(macd_series.iloc[-2])
         macd_improving = (
             macd_diff >= previous_macd_diff
             or macd_diff > -0.05
@@ -715,7 +683,7 @@ def analyze_indicators(
         .resample("15min")
         .agg(
             {
-                open_1m.name: "first",
+                get_column(df_1m, "open", "Open").name: "first",
                 high_1m.name: "max",
                 low_1m.name: "min",
                 close_1m.name: "last",
@@ -725,45 +693,20 @@ def analyze_indicators(
     )
 
     if len(df_15m) >= 15:
-
         atr_15m = calculate_atr(
             df_15m[high_1m.name],
             df_15m[low_1m.name],
             df_15m[close_1m.name],
         )
-
     else:
+        atr_15m = float(close_1m.iloc[-1]) * 0.01
 
-        atr_15m = float(
-            close_1m.iloc[-1]
-        ) * 0.01
-
-    close_4h = df_4h["Close"]
-
-    ema_20_4h = ta.trend.ema_indicator(
-        close_4h,
-        window=EMA_FAST,
-    ).iloc[-1]
-
-    ema_50_4h = ta.trend.ema_indicator(
-        close_4h,
-        window=EMA_SLOW,
-    ).iloc[-1]
-
-    trend_4h = (
-        "BULLISH"
-        if ema_20_4h >= ema_50_4h
-        else "BEARISH"
-    )
-
-    logger.debug(
-        f"[INDICATORS] "
-        f"RSI={rsi:.2f} "
-        f"PrevRSI={previous_rsi:.2f} "
-        f"MACD={macd_diff:.4f} "
-        f"PrevMACD={previous_macd_diff:.4f} "
-        f"4HTrend={trend_4h}"
-    )
+    trend_4h = "BULLISH"
+    if df_4h is not None and len(df_4h) >= EMA_SLOW:
+        close_4h = df_4h["Close"]
+        ema_20_4h = ta.trend.ema_indicator(close_4h, window=EMA_FAST).iloc[-1]
+        ema_50_4h = ta.trend.ema_indicator(close_4h, window=EMA_SLOW).iloc[-1]
+        trend_4h = "BULLISH" if ema_20_4h >= ema_50_4h else "BEARISH"
 
     return {
         "rsi": rsi,
@@ -772,23 +715,16 @@ def analyze_indicators(
         "rsi_recovering": rsi_recovering,
         "volume_spike": volume_spike,
         "macd_diff": macd_diff,
-        "previous_macd_diff": previous_macd_diff,
         "macd_improving": macd_improving,
         "short_term_bullish": short_term_bullish,
         "breakout_confirmation": breakout_confirmation,
         "trend_4h": trend_4h,
-        "latest_price": float(
-            close_1m.iloc[-1]
-        ),
-        "atr_15m": (
-            atr_15m
-            if atr_15m > 0
-            else float(close_1m.iloc[-1]) * 0.01
-        ),
+        "latest_price": float(close_1m.iloc[-1]),
+        "atr_15m": atr_15m if atr_15m > 0 else float(close_1m.iloc[-1]) * 0.01,
     }
 
 # =====================================================================
-# 8. SIGNAL ENGINE
+# 9. SIGNAL ENGINE
 # =====================================================================
 
 def bullish_signal(
@@ -796,11 +732,6 @@ def bullish_signal(
 ) -> Tuple[bool, List[str]]:
 
     reasons = []
-
-    if indicators["trend_4h"] == "BEARISH":
-        return False, ["4H trend bearish"]
-
-    reasons.append("4H trend supportive")
 
     rsi_ok = (
         indicators["rsi_reversal"]
@@ -814,127 +745,56 @@ def bullish_signal(
     reasons.append("RSI structure favorable")
 
     if not indicators["macd_improving"]:
-        return False, ["15m MACD weak"]
+        return False, ["MACD weak"]
 
     reasons.append("MACD acceptable")
 
     price_confirmation = (
         indicators["short_term_bullish"]
         or indicators["breakout_confirmation"]
-        or indicators["latest_price"] >= indicators.get("prev_close", 0)
     )
 
     if not price_confirmation:
-        return False, ["No price confirmation"]
+        return False, ["No momentum confirmation"]
 
-    reasons.append("price confirmation")
-
-    return True, reasons
-
-def inverse_bear_signal(
-    underlying_indicators: Dict[str, Any],
-    inverse_indicators: Dict[str, Any],
-) -> Tuple[bool, List[str]]:
-
-    reasons = []
-
-    if underlying_indicators["trend_4h"] == "BULLISH":
-        return False, ["QQQ 4H trend not bearish"]
-
-    reasons.append("QQQ 4H bearish or flat")
-
-    qqq_rsi_weak = underlying_indicators["rsi"] < 55
-
-    if not qqq_rsi_weak:
-        return False, ["QQQ downside momentum not confirmed"]
-
-    reasons.append("QQQ downside pressure")
+    reasons.append("momentum breakout confirmed")
 
     return True, reasons
 
 # =====================================================================
-# 9. RISK & CIRCUIT BREAKERS
+# 10. RISK & CIRCUIT BREAKERS
 # =====================================================================
 
 def get_account_equity() -> Optional[float]:
-
     try:
-
         account = trading_client.get_account()
-
         return float(account.equity)
-
     except Exception as e:
-
-        logger.error(
-            f"Failed to fetch account equity: {e}"
-        )
-
+        logger.error(f"Failed to fetch account equity: {e}")
         return None
 
 def audit_portfolio_risk_state() -> bool:
-
     try:
-
         account = trading_client.get_account()
-
         equity = float(account.equity)
         last_equity = float(account.last_equity)
 
         if last_equity <= 0:
-            logger.error(
-                "Invalid last_equity received."
-            )
             return True
 
-        drawdown_pct = (
-            equity - last_equity
-        ) / last_equity
+        drawdown_pct = (equity - last_equity) / last_equity
+        today_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
 
-        today_str = (
-            datetime.datetime.now(
-                datetime.timezone.utc
-            ).strftime("%Y-%m-%d")
-        )
-
-        cb_tripped_date = get_db_state(
-            "circuit_breaker_date"
-        )
-
-        if cb_tripped_date == today_str:
-
-            logger.warning(
-                "Circuit breaker already tripped today."
-            )
-
+        if get_db_state("circuit_breaker_date") == today_str:
             return True
 
-        if (
-            drawdown_pct
-            <= -MAX_DAILY_DRAWDOWN_PCT
-        ):
-
-            log_decision(
-                "🚨 CIRCUIT BREAKER TRIPPED! "
-                f"Drawdown={drawdown_pct * 100:.2f}%"
-            )
-
-            trading_client.close_all_positions(
-                cancel_orders=True
-            )
-
-            set_db_state(
-                "circuit_breaker_date",
-                today_str,
-            )
-
+        if drawdown_pct <= -MAX_DAILY_DRAWDOWN_PCT:
+            log_decision(f"🚨 CIRCUIT BREAKER TRIPPED! Drawdown={drawdown_pct * 100:.2f}%")
+            trading_client.close_all_positions(cancel_orders=True)
+            set_db_state("circuit_breaker_date", today_str)
             return True
-
     except Exception as e:
-
-        logger.error(
-            f"Error checking portfolio risk state: {e}"
-        )
+        logger.error(f"Error checking portfolio risk state: {e}")
 
     return False
 
@@ -944,36 +804,16 @@ def calculate_position_size(
     atr: float,
     risk_pct: float = RISK_PER_TRADE_PCT,
 ) -> float:
-
-    if (
-        equity <= 0
-        or price <= 0
-        or atr <= 0
-    ):
+    if equity <= 0 or price <= 0 or atr <= 0:
         return 0.0
 
     risk_dollar = equity * risk_pct
+    stop_distance = ATR_MULTIPLIER_STOP * atr
+    shares_by_risk = risk_dollar / stop_distance
+    max_position_dollar = equity * MAX_POSITION_PCT
+    max_shares_by_cap = max_position_dollar / price
 
-    stop_distance = (
-        ATR_MULTIPLIER_STOP * atr
-    )
-
-    shares_by_risk = (
-        risk_dollar / stop_distance
-    )
-
-    max_position_dollar = (
-        equity * MAX_POSITION_PCT
-    )
-
-    max_shares_by_cap = (
-        max_position_dollar / price
-    )
-
-    shares = min(
-        shares_by_risk,
-        max_shares_by_cap,
-    )
+    shares = min(shares_by_risk, max_shares_by_cap)
 
     if "/" in str(price):
         return max(0.0, round(shares, 4))
@@ -981,58 +821,24 @@ def calculate_position_size(
     return float(max(0, int(shares)))
 
 # =====================================================================
-# 10. POSITION / ORDER PROTECTION
+# 11. POSITION / ORDER PROTECTION
 # =====================================================================
 
 def get_open_position_symbols() -> Set[str]:
-
     try:
-
-        positions = (
-            trading_client.get_all_positions()
-        )
-
-        return {
-            position.symbol
-            for position in positions
-        }
-
+        positions = trading_client.get_all_positions()
+        return {position.symbol for position in positions}
     except Exception as e:
-
-        logger.error(
-            f"Failed fetching positions: {e}"
-        )
-
+        logger.error(f"Failed fetching positions: {e}")
         return set()
 
 def get_pending_order_symbols() -> Set[str]:
-
     try:
-
-        request = GetOrdersRequest(
-            status=QueryOrderStatus.OPEN,
-            nested=True,
-        )
-
-        orders = trading_client.get_orders(
-            filter=request
-        )
-
-        symbols = set()
-
-        for order in orders:
-
-            if hasattr(order, "symbol"):
-                symbols.add(order.symbol)
-
-        return symbols
-
+        request = GetOrdersRequest(status=QueryOrderStatus.OPEN, nested=True)
+        orders = trading_client.get_orders(filter=request)
+        return {order.symbol for order in orders if hasattr(order, "symbol")}
     except Exception as e:
-
-        logger.error(
-            f"Failed fetching pending orders: {e}"
-        )
-
+        logger.error(f"Failed fetching pending orders: {e}")
         return set()
 
 def symbol_available_for_entry(
@@ -1040,53 +846,20 @@ def symbol_available_for_entry(
     held_symbols: Set[str],
     pending_symbols: Set[str],
 ) -> bool:
-
-    if symbol in held_symbols:
-
-        logger.info(
-            f"[{symbol}] Already held. "
-            "Skipping entry."
-        )
-
-        return False
-
-    if symbol in pending_symbols:
-
-        logger.info(
-            f"[{symbol}] Pending order exists. "
-            "Skipping duplicate entry."
-        )
-
+    if symbol in held_symbols or symbol in pending_symbols:
         return False
 
     if is_symbol_on_cooldown(symbol):
-
-        remaining = cooldown_remaining(
-            symbol
-        )
-
-        logger.info(
-            f"[{symbol}] Cooldown active "
-            f"({remaining}s remaining)."
-        )
-
         return False
 
     return True
 
 # =====================================================================
-# 11. ORDER EXECUTION (GTC TIME-IN-FORCE)
+# 12. ORDER EXECUTION (GTC TIME-IN-FORCE)
 # =====================================================================
 
-def calculate_buy_limit_price(
-    latest_price: float,
-) -> float:
-
-    return round(
-        latest_price
-        * (1 + ENTRY_LIMIT_BUFFER_PCT),
-        2,
-    )
+def calculate_buy_limit_price(latest_price: float) -> float:
+    return round(latest_price * (1 + ENTRY_LIMIT_BUFFER_PCT), 2)
 
 def place_long_bracket_order(
     symbol: str,
@@ -1095,58 +868,17 @@ def place_long_bracket_order(
     atr: float,
 ) -> Optional[Any]:
 
-    if qty <= 0:
-
-        logger.warning(
-            f"[{symbol}] Position size is zero. "
-            "Order not submitted."
-        )
-
+    if qty <= 0 or latest_price <= 0 or atr <= 0:
         return None
 
-    if (
-        latest_price <= 0
-        or atr <= 0
-    ):
-
-        logger.warning(
-            f"[{symbol}] Invalid price or ATR."
-        )
-
-        return None
-
-    entry_price = calculate_buy_limit_price(
-        latest_price
-    )
-
-    stop_loss = round(
-        entry_price
-        - (
-            ATR_MULTIPLIER_STOP
-            * atr
-        ),
-        2,
-    )
-
-    take_profit = round(
-        entry_price
-        + (
-            ATR_MULTIPLIER_TARGET
-            * atr
-        ),
-        2,
-    )
+    entry_price = calculate_buy_limit_price(latest_price)
+    stop_loss = round(entry_price - (ATR_MULTIPLIER_STOP * atr), 2)
+    take_profit = round(entry_price + (ATR_MULTIPLIER_TARGET * atr), 2)
 
     if stop_loss <= 0:
-
-        logger.error(
-            f"[{symbol}] Stop loss invalid."
-        )
-
         return None
 
     try:
-
         order_data = LimitOrderRequest(
             symbol=symbol,
             limit_price=entry_price,
@@ -1154,20 +886,11 @@ def place_long_bracket_order(
             side=OrderSide.BUY,
             time_in_force=TimeInForce.GTC,
             order_class=OrderClass.BRACKET,
-            stop_loss=StopLossRequest(
-                stop_price=stop_loss
-            ),
-            take_profit=TakeProfitRequest(
-                limit_price=take_profit
-            ),
+            stop_loss=StopLossRequest(stop_price=stop_loss),
+            take_profit=TakeProfitRequest(limit_price=take_profit),
         )
 
-        response = (
-            trading_client.submit_order(
-                order_data
-            )
-        )
-
+        response = trading_client.submit_order(order_data)
         set_symbol_cooldown(symbol)
 
         record_trade(
@@ -1181,26 +904,18 @@ def place_long_bracket_order(
         )
 
         log_decision(
-            f"🚀 ORDER SUBMITTED (GTC) | "
-            f"{symbol} BUY {qty} | "
-            f"Entry={entry_price:.2f} | "
-            f"SL={stop_loss:.2f} | "
-            f"TP={take_profit:.2f}"
+            f"🚀 ORDER SUBMITTED (GTC) | {symbol} BUY {qty} | "
+            f"Entry={entry_price:.2f} | SL={stop_loss:.2f} | TP={take_profit:.2f}"
         )
 
         return response
 
     except Exception as e:
-
-        logger.error(
-            f"❌ Failed placing order "
-            f"for {symbol}: {e}"
-        )
-
+        logger.error(f"❌ Failed placing order for {symbol}: {e}")
         return None
 
 # =====================================================================
-# 12. MARKET SESSION MANAGEMENT
+# 13. MARKET SESSION MANAGEMENT
 # =====================================================================
 
 def market_is_tradeable(is_crypto: bool = False) -> bool:
@@ -1208,399 +923,132 @@ def market_is_tradeable(is_crypto: bool = False) -> bool:
         return True
 
     try:
-
         clock = trading_client.get_clock()
-
         if not clock.is_open:
-
-            logger.info(
-                "Market is closed. Skipping stock cycle."
-            )
-
             return False
 
-        now_et = datetime.datetime.now(
-            zoneinfo.ZoneInfo(
-                "America/New_York"
-            )
-        )
+        now_et = datetime.datetime.now(zoneinfo.ZoneInfo("America/New_York"))
+        market_close = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
+        seconds_to_close = (market_close - now_et).total_seconds()
 
-        market_close = now_et.replace(
-            hour=16,
-            minute=0,
-            second=0,
-            microsecond=0,
-        )
-
-        seconds_to_close = (
-            market_close - now_et
-        ).total_seconds()
-
-        if (
-            0 < seconds_to_close <= 600
-        ):
-
-            log_decision(
-                "⏰ Within 10 minutes of "
-                "market close. Liquidating."
-            )
-
-            trading_client.close_all_positions(
-                cancel_orders=True
-            )
-
+        if 0 < seconds_to_close <= 600:
+            log_decision("⏰ Within 10 minutes of market close. Liquidating.")
+            trading_client.close_all_positions(cancel_orders=True)
             return False
 
         return True
-
     except Exception as e:
-
-        logger.error(
-            f"Failed checking market clock: {e}"
-        )
-
+        logger.error(f"Failed checking market clock: {e}")
         return False
 
 # =====================================================================
-# 13. MAIN TRADING CYCLE
+# 14. MAIN TRADING CYCLE (DYNAMIC SCREENER LOOP)
 # =====================================================================
 
 def run_cycle():
-
-    logger.info(
-        "=== STARTING TRADING CYCLE ==="
-    )
+    logger.info("=== STARTING TRADING CYCLE ===")
 
     if audit_portfolio_risk_state():
-
-        logger.warning(
-            "Trading halted by circuit breaker."
-        )
-
         return
 
     equity = get_account_equity()
-
     if equity is None or equity <= 0:
-
-        logger.error(
-            "Invalid account equity. "
-            "Skipping cycle."
-        )
-
         return
 
-    held_symbols = (
-        get_open_position_symbols()
-    )
-
-    pending_symbols = (
-        get_pending_order_symbols()
-    )
-
-    active_symbols = (
-        held_symbols | pending_symbols
-    )
+    held_symbols = get_open_position_symbols()
+    pending_symbols = get_pending_order_symbols()
+    active_symbols = held_symbols | pending_symbols
 
     logger.info(
-        f"Portfolio state | "
-        f"Positions={len(held_symbols)} | "
-        f"Pending={len(pending_symbols)} | "
-        f"Active={len(active_symbols)}"
+        f"Portfolio state | Positions={len(held_symbols)} | "
+        f"Pending={len(pending_symbols)} | Active={len(active_symbols)}"
     )
 
-    if (
-        len(active_symbols)
-        >= MAX_TOTAL_ACTIVE_TRADES
-    ):
-
-        logger.info(
-            "Maximum active trade capacity reached."
-        )
-
+    if len(active_symbols) >= MAX_TOTAL_ACTIVE_TRADES:
+        logger.info("Maximum active trade capacity reached.")
         return
 
-    spy_4h = fetch_4h_bars_cached(
-        "SPY"
-    )
+    # Dynamically generate fresh high-momentum target list every cycle
+    current_targets = get_dynamic_momentum_watchlist(max_stocks=12)
 
-    qqq_4h = fetch_4h_bars_cached(
-        "QQQ"
-    )
-
-    if (
-        spy_4h is None
-        or qqq_4h is None
-        or len(spy_4h) < EMA_SLOW
-        or len(qqq_4h) < EMA_SLOW
-    ):
-
-        logger.warning(
-            "Insufficient 4H market context."
-        )
-
-        return
-
-    spy_1m = fetch_1m_bars(
-        "SPY",
-        limit=120,
-    )
-
-    qqq_1m = fetch_1m_bars(
-        "QQQ",
-        limit=120,
-    )
-
-    if (
-        spy_1m is None
-        or qqq_1m is None
-        or len(spy_1m) < 30
-        or len(qqq_1m) < 30
-    ):
-
-        logger.warning(
-            "Failed obtaining baseline 1m data."
-        )
-
-        return
-
-    try:
-
-        spy_indicators = analyze_indicators(
-            spy_1m,
-            spy_4h,
-        )
-
-        qqq_indicators = analyze_indicators(
-            qqq_1m,
-            qqq_4h,
-        )
-
-    except Exception as e:
-
-        logger.error(
-            f"Baseline indicator failure: {e}"
-        )
-
-        return
-
-    for ticker in TARGETS:
-
+    for ticker in current_targets:
         is_crypto_target = "/" in ticker
 
         if not is_crypto_target and not market_is_tradeable(is_crypto=False):
             continue
 
-        active_symbols = (
-            get_open_position_symbols()
-            | get_pending_order_symbols()
-        )
-
-        if (
-            len(active_symbols)
-            >= MAX_TOTAL_ACTIVE_TRADES
-        ):
-
-            logger.info(
-                "Active trade capacity reached "
-                "during scan."
-            )
-
+        active_symbols = get_open_position_symbols() | get_pending_order_symbols()
+        if len(active_symbols) >= MAX_TOTAL_ACTIVE_TRADES:
+            logger.info("Active trade capacity reached during scan.")
             break
 
-        if not symbol_available_for_entry(
-            ticker,
-            get_open_position_symbols(),
-            get_pending_order_symbols(),
-        ):
+        if not symbol_available_for_entry(ticker, get_open_position_symbols(), get_pending_order_symbols()):
             continue
 
-        df_1m = fetch_1m_bars(
-            ticker,
-            limit=120,
-        )
-
+        df_1m = fetch_1m_bars(ticker, limit=120)
         if df_1m is None or len(df_1m) < 30:
             continue
 
         if not passes_volatility_filter(df_1m):
-            logger.info(f"[{ticker}] Skipped: Fails volatility/RVOL hurdle.")
+            logger.info(f"[{ticker}] Skipped: Fails momentum/RVOL hurdle.")
             continue
 
-        if ticker == "SPY":
+        df_4h = fetch_4h_bars_cached("SPY" if not is_crypto_target else "BTC-USD")
+        indicators = analyze_indicators(df_1m, df_4h)
 
-            valid, reasons = bullish_signal(
-                spy_indicators
-            )
-
-            indicators = spy_indicators
-
-        elif ticker == "QQQ":
-
-            valid, reasons = bullish_signal(
-                qqq_indicators
-            )
-
-            indicators = qqq_indicators
-
-        elif ticker == "TQQQ":
-
-            indicators = analyze_indicators(
-                df_1m,
-                qqq_4h,
-            )
-
-            indicators["trend_4h"] = (
-                qqq_indicators["trend_4h"]
-            )
-
-            valid, reasons = bullish_signal(
-                indicators
-            )
-
-        elif ticker == "SQQQ":
-
-            indicators = analyze_indicators(
-                df_1m,
-                qqq_4h,
-            )
-
-            valid, reasons = inverse_bear_signal(
-                qqq_indicators,
-                indicators,
-            )
-
-        else:
-            indicators = analyze_indicators(
-                df_1m,
-                spy_4h,
-            )
-
-            indicators["trend_4h"] = (
-                spy_indicators["trend_4h"]
-            )
-
-            valid, reasons = bullish_signal(
-                indicators
-            )
+        valid, reasons = bullish_signal(indicators)
 
         logger.info(
-            f"[{ticker}] "
-            f"Price={indicators['latest_price']:.2f} | "
-            f"4H={indicators['trend_4h']} | "
-            f"RSI={indicators['rsi']:.1f} | "
-            f"MACD={indicators['macd_diff']:.4f} | "
-            f"Signal={valid}"
+            f"[{ticker}] Price={indicators['latest_price']:.2f} | "
+            f"RSI={indicators['rsi']:.1f} | MACD={indicators['macd_diff']:.4f} | Signal={valid}"
         )
 
         if not valid:
-
-            logger.info(
-                f"[{ticker}] No trade: "
-                + ", ".join(reasons)
-            )
-
             continue
 
-        final_positions = (
-            get_open_position_symbols()
-        )
-
-        final_pending = (
-            get_pending_order_symbols()
-        )
-
-        if not symbol_available_for_entry(
-            ticker,
-            final_positions,
-            final_pending,
-        ):
-
+        if not symbol_available_for_entry(ticker, get_open_position_symbols(), get_pending_order_symbols()):
             continue
 
         qty = calculate_position_size(
             equity=equity,
-            price=indicators[
-                "latest_price"
-            ],
-            atr=indicators[
-                "atr_15m"
-            ],
+            price=indicators["latest_price"],
+            atr=indicators["atr_15m"],
         )
 
         if qty <= 0:
-
-            logger.warning(
-                f"[{ticker}] Calculated quantity "
-                "is zero."
-            )
-
             continue
 
-        log_decision(
-            f"📈 SIGNAL VALID | {ticker} | "
-            + " | ".join(reasons)
-        )
+        log_decision(f"📈 SIGNAL VALID | {ticker} | " + " | ".join(reasons))
 
         response = place_long_bracket_order(
             symbol=ticker,
             qty=qty,
-            latest_price=indicators[
-                "latest_price"
-            ],
-            atr=indicators[
-                "atr_15m"
-            ],
+            latest_price=indicators["latest_price"],
+            atr=indicators["atr_15m"],
         )
 
         if response is not None:
-
             time.sleep(2)
 
 # =====================================================================
-# 14. MAIN
+# 15. MAIN
 # =====================================================================
 
 def main():
-
     init_db()
-
-    logger.info(
-        "🤖 Bull. Bear and Broke - "
-        "Trading Engine Online "
-        "(v9 Bulletproof + Asymmetric GTC)"
-    )
-
-    logger.info(
-        f"Paper trading: {PAPER_TRADING}"
-    )
+    logger.info("🤖 Bull. Bear and Broke - Trading Engine Online (v10 Dynamic Momentum)")
+    logger.info(f"Paper trading: {PAPER_TRADING}")
 
     while type(True):
-
         try:
-
             run_cycle()
-
         except KeyboardInterrupt:
-
-            logger.info(
-                "Trading engine stopped by user."
-            )
-
+            logger.info("Trading engine stopped by user.")
             break
-
         except Exception as e:
+            logger.exception(f"❌ Critical error in main trading loop: {e}")
 
-            logger.exception(
-                f"❌ Critical error in "
-                f"main trading loop: {e}"
-            )
-
-        logger.info(
-            "💤 Sleeping for 180 seconds "
-            "(3 minutes) before next cycle..."
-        )
-
+        logger.info("💤 Sleeping for 180 seconds (3 minutes) before next cycle...")
         time.sleep(180)
 
 if __name__ == "__main__":
