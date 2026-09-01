@@ -1,7 +1,8 @@
 # =====================================================================
 # BULL. BEAR AND BROKE - TRADING ENGINE (main_v9_bulletproof.py)
 # Fully patched with lenient volume gates, resilient bar fetching,
-# and graceful handling of temporary data gaps for stocks and crypto.
+# GTC time-in-force multi-day bracket legs, asymmetric 3.5:1 reward-to-risk,
+# and high-beta volatility/RVOL filtering.
 # =====================================================================
 
 import os
@@ -186,8 +187,9 @@ REVERSAL_RSI = 45
 EMA_FAST = 20
 EMA_SLOW = 50
 
+# Asymmetric reward-to-risk multipliers (~3.5x reward profile)
 ATR_MULTIPLIER_STOP = 1.5
-ATR_MULTIPLIER_TARGET = 2.5
+ATR_MULTIPLIER_TARGET = 5.25
 
 # Limit order offset
 ENTRY_LIMIT_BUFFER_PCT = 0.0005
@@ -518,7 +520,7 @@ def fetch_1m_bars(
     return None
 
 # =====================================================================
-# 7. INDICATORS (LENIENT VOLUME GATE)
+# 7. INDICATORS, VOLATILITY & RVOL FILTERS
 # =====================================================================
 
 def get_column(
@@ -564,6 +566,33 @@ def calculate_atr(
     ).mean().iloc[-1]
 
     return float(atr)
+
+def passes_volatility_filter(df_1m: pd.DataFrame) -> bool:
+    try:
+        close = get_column(df_1m, "close", "Close")
+        high = get_column(df_1m, "high", "High")
+        low = get_column(df_1m, "low", "Low")
+        volume = get_column(df_1m, "volume", "Volume")
+
+        atr = calculate_atr(high, low, close, window=14)
+        current_price = float(close.iloc[-1])
+        if current_price <= 0:
+            return False
+            
+        atr_percentage = (atr / current_price) * 100
+
+        avg_vol = volume.rolling(window=20).mean().iloc[-1]
+        current_vol = volume.iloc[-1]
+        
+        if pd.isna(avg_vol) or avg_vol == 0:
+            rvol = 1.0
+        else:
+            rvol = current_vol / avg_vol
+
+        return atr_percentage >= 1.5 and rvol >= 0.8
+    except Exception as e:
+        logger.warning(f"Volatility filter check failed: {e}")
+        return True
 
 def analyze_indicators(
     df_1m: pd.DataFrame,
@@ -618,7 +647,6 @@ def analyze_indicators(
         and rsi >= REVERSAL_RSI
     )
 
-    # Completely lenient volume check so it never blocks valid trades
     volume_spike = True
 
     ema_fast_1m = ta.trend.ema_indicator(
@@ -1047,7 +1075,7 @@ def symbol_available_for_entry(
     return True
 
 # =====================================================================
-# 11. ORDER EXECUTION
+# 11. ORDER EXECUTION (GTC TIME-IN-FORCE)
 # =====================================================================
 
 def calculate_buy_limit_price(
@@ -1153,7 +1181,7 @@ def place_long_bracket_order(
         )
 
         log_decision(
-            f"🚀 ORDER SUBMITTED | "
+            f"🚀 ORDER SUBMITTED (GTC) | "
             f"{symbol} BUY {qty} | "
             f"Entry={entry_price:.2f} | "
             f"SL={stop_loss:.2f} | "
@@ -1395,6 +1423,10 @@ def run_cycle():
         if df_1m is None or len(df_1m) < 30:
             continue
 
+        if not passes_volatility_filter(df_1m):
+            logger.info(f"[{ticker}] Skipped: Fails volatility/RVOL hurdle.")
+            continue
+
         if ticker == "SPY":
 
             valid, reasons = bullish_signal(
@@ -1536,7 +1568,7 @@ def main():
     logger.info(
         "🤖 Bull. Bear and Broke - "
         "Trading Engine Online "
-        "(v9 Bulletproof)"
+        "(v9 Bulletproof + Asymmetric GTC)"
     )
 
     logger.info(
