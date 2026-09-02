@@ -142,13 +142,20 @@ def run_backtest(symbol: str, period: str = "60d", interval: str = "15m") -> Dic
     gross_loss = abs(sum(t['pnl'] for t in losses))
     profit_factor = (gross_win / gross_loss) if gross_loss > 0 else (float('inf') if gross_win > 0 else 0.0)
 
+    # [FIX] float('inf') isn't valid JSON — it was silently breaking the
+    # Supabase insert at the very end of the run. Store it as None for
+    # JSON/DB purposes; the console print still shows "inf" separately.
+    profit_factor_display = "inf" if profit_factor == float('inf') else round(profit_factor, 2)
+    profit_factor_json = None if profit_factor == float('inf') else round(profit_factor, 2)
+
     return {
         "symbol": symbol,
         "total_trades": total_trades,
         "win_rate": round(win_rate, 2),
         "total_pnl": round(total_pnl, 2),
         "expectancy": round(expectancy, 2),
-        "profit_factor": round(profit_factor, 2) if profit_factor != float('inf') else profit_factor,
+        "profit_factor": profit_factor_json,
+        "profit_factor_display": profit_factor_display,
         "ambiguous_bars": ambiguous_bars,
     }
 
@@ -167,7 +174,7 @@ if __name__ == "__main__":
         print(
             f"[{res['symbol']:<5}] Trades: {res['total_trades']:<3} | "
             f"Win Rate: {res['win_rate']:>5.1f}% | Net P&L: ${res['total_pnl']:>8.2f} | "
-            f"Expectancy: ${res['expectancy']:>7.2f} | PF: {res['profit_factor']:>5}{amb_note}"
+            f"Expectancy: ${res['expectancy']:>7.2f} | PF: {res['profit_factor_display']:>5}{amb_note}"
         )
 
     total_all_pnl = float(sum(s['total_pnl'] for s in summary))
