@@ -194,17 +194,23 @@ if __name__ == "__main__":
         print(f"⚠️  Sample size is small ({total_all_trades} trades). Treat these win-rate numbers as directional, not reliable, until you have a much larger sample (e.g. longer history at 1h/4h resolution).")
     print("=========================================================")
 
-    # Push metrics to Supabase
+    # [FIX] Actual backtest_runs schema is per-ticker rows:
+    # (id, created_at, ticker, trades, win_rate, net_pnl) — NOT a single
+    # aggregate row with strategy_name/avg_win_rate/ticker_summary. That
+    # mismatch is why every previous push failed. Insert one row per
+    # ticker instead, matching the real columns exactly.
     if supabase:
         try:
-            payload = {
-                "strategy_name": "RSI_VOL_4H_BULL",
-                "total_trades": total_all_trades,
-                "avg_win_rate": round(avg_win_rate, 2),
-                "total_pnl": round(total_all_pnl, 2),
-                "ticker_summary": summary
-            }
-            supabase.table("backtest_runs").insert(payload).execute()
-            print("🚀 Successfully saved backtest results to Supabase.")
+            rows = [
+                {
+                    "ticker": s["symbol"],
+                    "trades": s["total_trades"],
+                    "win_rate": s["win_rate"],
+                    "net_pnl": s["total_pnl"],
+                }
+                for s in summary
+            ]
+            supabase.table("backtest_runs").insert(rows).execute()
+            print(f"🚀 Successfully saved {len(rows)} ticker rows to Supabase.")
         except Exception as e:
             print(f"❌ Failed to push results to Supabase: {e}")
