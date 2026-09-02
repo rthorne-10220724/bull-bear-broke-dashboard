@@ -1,34 +1,41 @@
 """
-BULL. BEAR AND BROKE - V13 BACKTEST
-===================================
+BULL. BEAR AND BROKE - V13.1 BACKTEST
+=====================================
 
-V13 BACKTESTER
+V13 diagnostic backtest.
 
-Tests the existing V13 strategy.py signal engine using:
+Purpose:
+    Fix the Yahoo 1-minute data-window issue and diagnose why V13
+    may generate zero trades.
 
-    - 1-minute execution data
-    - 4H regime
-    - 15M confirmation
+Tests:
+    - 1-minute Yahoo data
     - shared strategy.py signal engine
     - next-bar execution
     - ATR stop
     - ATR target
     - slippage
     - commissions
-    - conservative same-bar ambiguity handling
+    - same-bar ambiguity handling
     - forced end-of-data exits
-    - fixed-risk position sizing
+    - position sizing
     - maximum drawdown
     - R statistics
+    - signal diagnostics
 
 IMPORTANT:
-    Yahoo Finance has strict limits on historical 1-minute data.
-    Do NOT request 60d of 1m data.
+    This file does NOT intentionally change the V13 trading rules.
 
-    This backtester therefore uses a short 1-minute window that
-    Yahoo can actually supply.
+    It is designed to determine whether:
+        1. indicators are not being populated,
+        2. V13 signal conditions are too restrictive,
+        3. signals exist but position sizing rejects them,
+        4. or the data window is insufficient.
 
-    This is a historical test, NOT a guarantee of future performance.
+Yahoo currently limits 1-minute historical data to short windows.
+Therefore this backtest uses 7 days and diagnoses the higher-timeframe
+indicator availability rather than pretending 60 days of 1-minute data
+is available.
 """
 
 from __future__ import annotations
@@ -65,47 +72,29 @@ TICKERS = [
     "RIOT",
 ]
 
-# IMPORTANT:
-# Yahoo limits 1-minute historical data.
-#
-# Use a maximum of 7 days so we stay safely inside the
-# commonly enforced 8-day-per-request limitation.
+# Yahoo 1m historical data is limited.
 PERIOD = "7d"
 INTERVAL = "1m"
 
 STARTING_CAPITAL = 1000.0
 
-# Buyer pays slightly more on entry.
-# Seller receives slightly less on exit.
 SLIPPAGE_PCT = 0.0005
-
 COMMISSION_PER_TRADE = 0.0
 
-# Risk 0.75% of current equity per trade.
 RISK_PER_TRADE_PCT = 0.0075
-
-# Never allocate more than 25% of equity to one position.
 MAX_POSITION_PCT = 0.25
 
-# Minimum number of bars before signals are considered.
+# Keep this deliberately modest for a 7-day 1m test.
 WARMUP_BARS = 500
 
 
 # ============================================================================
-# DATA DOWNLOAD
+# DATA
 # ============================================================================
 
 def download_data(symbol: str) -> pd.DataFrame:
-    """
-    Download 1-minute OHLCV data from Yahoo Finance.
 
-    IMPORTANT:
-        Do not change PERIOD to 60d for 1-minute data.
-        Yahoo does not provide that much 1-minute history in a
-        normal request.
-    """
-
-    print(f"[{symbol:<5}] downloading {PERIOD} of {INTERVAL} data...")
+    print(f"[{symbol:<5}] downloading {PERIOD} of 1m data...")
 
     try:
         df = yf.download(
@@ -114,7 +103,6 @@ def download_data(symbol: str) -> pd.DataFrame:
             interval=INTERVAL,
             auto_adjust=False,
             progress=False,
-            prepost=False,
             threads=False,
         )
     except Exception as exc:
@@ -122,42 +110,44 @@ def download_data(symbol: str) -> pd.DataFrame:
         return pd.DataFrame()
 
     if df is None or df.empty:
-        print(f"[{symbol:<5}] no data returned")
         return pd.DataFrame()
 
-    # ------------------------------------------------------------------------
-    # Flatten yfinance MultiIndex columns.
-    # ------------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Flatten yfinance MultiIndex.
+    # ------------------------------------------------------------------
 
     if isinstance(df.columns, pd.MultiIndex):
 
-        # Typical yfinance layout:
-        #
-        # Open / High / Low / Close / Volume
-        # with ticker as another level.
-        #
-        # Try to extract this symbol cleanly.
+        # Typical yfinance format:
+        # ('Open', 'SPY'), ('High', 'SPY'), ...
+        if symbol in df.columns.get_level_values(-1):
 
-        try:
-
-            if symbol in df.columns.get_level_values(-1):
-
+            try:
                 df = df.xs(
                     symbol,
                     level=-1,
                     axis=1,
                 )
+            except Exception:
+                pass
 
-            elif symbol in df.columns.get_level_values(0):
+        elif symbol in df.columns.get_level_values(0):
 
+            try:
                 df = df.xs(
                     symbol,
                     level=0,
                     axis=1,
                 )
+            except Exception:
+                pass
 
-        except Exception:
-            pass
+        # If still MultiIndex, flatten names.
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = [
+                str(column[0])
+                for column in df.columns
+            ]
 
     required = [
         "Open",
@@ -181,10 +171,6 @@ def download_data(symbol: str) -> pd.DataFrame:
 
     df = df[required].copy()
 
-    # ------------------------------------------------------------------------
-    # Numeric conversion.
-    # ------------------------------------------------------------------------
-
     for column in required:
 
         df[column] = pd.to_numeric(
@@ -192,46 +178,15 @@ def download_data(symbol: str) -> pd.DataFrame:
             errors="coerce",
         )
 
-    df.dropna(
-        subset=required,
-        inplace=True,
-    )
+    df.dropna(inplace=True)
 
-    if df.empty:
-        print(f"[{symbol:<5}] all rows invalid")
-        return pd.DataFrame()
-
-    # ------------------------------------------------------------------------
-    # Timestamp cleanup.
-    # ------------------------------------------------------------------------
-
-    df.sort_index(
-        inplace=True
-    )
+    df.sort_index(inplace=True)
 
     df = df[
         ~df.index.duplicated(
             keep="last"
         )
     ]
-
-    # Remove impossible prices.
-    df = df[
-        (df["Open"] > 0)
-        & (df["High"] > 0)
-        & (df["Low"] > 0)
-        & (df["Close"] > 0)
-    ]
-
-    if df.empty:
-        print(f"[{symbol:<5}] no valid price data")
-        return pd.DataFrame()
-
-    print(
-        f"[{symbol:<5}] "
-        f"{len(df):,} bars | "
-        f"{df.index[0]} -> {df.index[-1]}"
-    )
 
     return df
 
@@ -243,60 +198,40 @@ def download_data(symbol: str) -> pd.DataFrame:
 def prepare_features(
     df: pd.DataFrame,
 ) -> pd.DataFrame:
-    """
-    Run the exact shared V13 indicator engine.
 
-    No strategy logic is duplicated here.
-    """
-
-    if df.empty:
-        return df
+    print("          calculating V13 indicators...")
 
     try:
-
-        df = calculate_indicators(
-            df.copy()
-        )
-
+        df = calculate_indicators(df.copy())
     except Exception as exc:
-
         print(
-            f"feature calculation error: {exc}"
+            f"          indicator error: {exc}"
         )
-
         return pd.DataFrame()
 
     if df.empty:
         return df
 
-    # ------------------------------------------------------------------------
-    # Previous values used by the signal engine.
+    # ------------------------------------------------------------------
+    # Diagnostic / previous-value columns.
     #
-    # These are shifted one bar so the signal does not accidentally
-    # use future information.
-    # ------------------------------------------------------------------------
+    # These are only added if the underlying columns exist.
+    # ------------------------------------------------------------------
 
     if "RSI_1M" in df.columns:
-
         df["PREV_RSI_1M"] = (
             df["RSI_1M"].shift(1)
         )
 
     if "MACD_DIFF_15M" in df.columns:
-
         df["PREV_MACD_DIFF_15M"] = (
             df["MACD_DIFF_15M"].shift(1)
         )
 
     if "EMA20_4H" in df.columns:
-
         df["PREV_EMA20_4H"] = (
             df["EMA20_4H"].shift(1)
         )
-
-    # ------------------------------------------------------------------------
-    # Previous completed 5-bar high.
-    # ------------------------------------------------------------------------
 
     df["PREV_5_HIGH"] = (
         df["High"]
@@ -309,6 +244,62 @@ def prepare_features(
 
 
 # ============================================================================
+# INDICATOR DIAGNOSTICS
+# ============================================================================
+
+def indicator_diagnostics(
+    symbol: str,
+    df: pd.DataFrame,
+) -> None:
+
+    print()
+    print(
+        f"          [{symbol}] INDICATOR DIAGNOSTICS"
+    )
+
+    expected = [
+        "ATR_1M",
+        "RSI_1M",
+        "MACD_DIFF_15M",
+        "EMA20_4H",
+    ]
+
+    for column in expected:
+
+        if column not in df.columns:
+
+            print(
+                f"          {column:<18} MISSING"
+            )
+
+            continue
+
+        valid = (
+            df[column]
+            .replace(
+                [np.inf, -np.inf],
+                np.nan,
+            )
+            .notna()
+            .sum()
+        )
+
+        total = len(df)
+
+        pct = (
+            valid / total * 100
+            if total
+            else 0.0
+        )
+
+        print(
+            f"          {column:<18} "
+            f"{valid:>5}/{total:<5} valid "
+            f"({pct:>5.1f}%)"
+        )
+
+
+# ============================================================================
 # POSITION SIZING
 # ============================================================================
 
@@ -317,16 +308,6 @@ def calculate_position_size(
     entry_price: float,
     stop_price: float,
 ) -> int:
-    """
-    Position size based on fixed account risk.
-
-    Example:
-        Equity = $1,000
-        Risk = 0.75%
-        Risk budget = $7.50
-
-    The position is also capped at MAX_POSITION_PCT of equity.
-    """
 
     if (
         equity <= 0
@@ -336,16 +317,14 @@ def calculate_position_size(
         return 0
 
     risk_per_share = (
-        entry_price
-        - stop_price
+        entry_price - stop_price
     )
 
     if risk_per_share <= 0:
         return 0
 
     risk_dollars = (
-        equity
-        * RISK_PER_TRADE_PCT
+        equity * RISK_PER_TRADE_PCT
     )
 
     qty_by_risk = (
@@ -354,8 +333,7 @@ def calculate_position_size(
     )
 
     max_position_dollars = (
-        equity
-        * MAX_POSITION_PCT
+        equity * MAX_POSITION_PCT
     )
 
     qty_by_cap = (
@@ -375,50 +353,36 @@ def calculate_position_size(
 
 
 # ============================================================================
-# TRADE EXIT HELPER
+# RESULT FACTORY
 # ============================================================================
 
-def close_trade(
-    trades: List[Dict[str, Any]],
+def empty_result(
     symbol: str,
-    qty: int,
-    entry_price: float,
-    exit_price: float,
-    risk_dollars: float,
-    outcome: str,
-) -> float:
-    """
-    Record a completed trade and return its P&L.
-    """
+) -> Dict[str, Any]:
 
-    pnl = (
-        qty
-        * (
-            exit_price
-            - entry_price
-        )
-        - COMMISSION_PER_TRADE
-    )
+    return {
+        "symbol": symbol,
+        "trades": 0,
+        "wins": 0,
+        "losses": 0,
+        "win_rate": 0.0,
+        "pnl": 0.0,
+        "expectancy": 0.0,
+        "profit_factor": 0.0,
+        "pf_display": "0.00",
+        "avg_r": 0.0,
+        "max_drawdown": 0.0,
+        "ambiguous_bars": 0,
+        "forced_exits": 0,
 
-    r_multiple = (
-        pnl / risk_dollars
-        if risk_dollars > 0
-        else 0.0
-    )
-
-    trades.append(
-        {
-            "symbol": symbol,
-            "entry": entry_price,
-            "exit": exit_price,
-            "qty": qty,
-            "pnl": pnl,
-            "r": r_multiple,
-            "outcome": outcome,
-        }
-    )
-
-    return pnl
+        # Diagnostics.
+        "rows_checked": 0,
+        "valid_atr": 0,
+        "signals_valid": 0,
+        "signals_invalid": 0,
+        "exit_errors": 0,
+        "zero_qty": 0,
+    }
 
 
 # ============================================================================
@@ -433,16 +397,6 @@ def run_backtest(
     if df.empty:
         return empty_result(symbol)
 
-    if len(df) <= WARMUP_BARS + 1:
-
-        print(
-            f"[{symbol:<5}] "
-            f"not enough bars "
-            f"({len(df)} available)"
-        )
-
-        return empty_result(symbol)
-
     equity = STARTING_CAPITAL
 
     trades: List[Dict[str, Any]] = []
@@ -450,7 +404,6 @@ def run_backtest(
     in_trade = False
 
     qty = 0
-
     entry_price = 0.0
     stop_price = 0.0
     target_price = 0.0
@@ -459,13 +412,20 @@ def run_backtest(
     ambiguous_bars = 0
     forced_exits = 0
 
+    rows_checked = 0
+    valid_atr = 0
+    signals_valid = 0
+    signals_invalid = 0
+    exit_errors = 0
+    zero_qty = 0
+
     equity_curve = [
         equity
     ]
 
-    # =========================================================================
+    # ==================================================================
     # MAIN LOOP
-    # =========================================================================
+    # ==================================================================
 
     for i in range(
         WARMUP_BARS,
@@ -474,19 +434,16 @@ def run_backtest(
 
         row = df.iloc[i]
 
-        # =====================================================================
+        rows_checked += 1
+
+        # ==============================================================
         # MANAGE OPEN POSITION
-        # =====================================================================
+        # ==============================================================
 
         if in_trade:
 
-            high = float(
-                row["High"]
-            )
-
-            low = float(
-                row["Low"]
-            )
+            high = float(row["High"])
+            low = float(row["Low"])
 
             hit_stop = (
                 low <= stop_price
@@ -496,14 +453,11 @@ def run_backtest(
                 high >= target_price
             )
 
-            # -----------------------------------------------------------------
-            # BOTH STOP AND TARGET TOUCHED.
-            #
-            # We do not know which occurred first inside a 1-minute OHLC bar.
-            #
+            # ----------------------------------------------------------
+            # Ambiguous bar.
             # Conservative assumption:
-            # STOP FIRST.
-            # -----------------------------------------------------------------
+            # stop first.
+            # ----------------------------------------------------------
 
             if hit_stop and hit_target:
 
@@ -511,137 +465,198 @@ def run_backtest(
 
                 exit_price = (
                     stop_price
-                    * (
-                        1
-                        - SLIPPAGE_PCT
-                    )
+                    * (1 - SLIPPAGE_PCT)
                 )
 
-                pnl = close_trade(
-                    trades=trades,
-                    symbol=symbol,
-                    qty=qty,
-                    entry_price=entry_price,
-                    exit_price=exit_price,
-                    risk_dollars=risk_dollars,
-                    outcome="LOSS",
+                pnl = (
+                    qty
+                    * (
+                        exit_price
+                        - entry_price
+                    )
+                    - COMMISSION_PER_TRADE
+                )
+
+                r_multiple = (
+                    pnl / risk_dollars
+                    if risk_dollars > 0
+                    else 0.0
+                )
+
+                trades.append(
+                    {
+                        "symbol": symbol,
+                        "entry": entry_price,
+                        "exit": exit_price,
+                        "qty": qty,
+                        "pnl": pnl,
+                        "r": r_multiple,
+                        "outcome": "LOSS",
+                    }
                 )
 
                 equity += pnl
-
-                equity_curve.append(
-                    equity
-                )
+                equity_curve.append(equity)
 
                 in_trade = False
-
                 continue
 
-            # -----------------------------------------------------------------
-            # TARGET
-            # -----------------------------------------------------------------
+            # ----------------------------------------------------------
+            # Target.
+            # ----------------------------------------------------------
 
             if hit_target:
 
                 exit_price = (
                     target_price
-                    * (
-                        1
-                        - SLIPPAGE_PCT
-                    )
+                    * (1 - SLIPPAGE_PCT)
                 )
 
-                pnl = close_trade(
-                    trades=trades,
-                    symbol=symbol,
-                    qty=qty,
-                    entry_price=entry_price,
-                    exit_price=exit_price,
-                    risk_dollars=risk_dollars,
-                    outcome="WIN",
+                pnl = (
+                    qty
+                    * (
+                        exit_price
+                        - entry_price
+                    )
+                    - COMMISSION_PER_TRADE
+                )
+
+                r_multiple = (
+                    pnl / risk_dollars
+                    if risk_dollars > 0
+                    else 0.0
+                )
+
+                trades.append(
+                    {
+                        "symbol": symbol,
+                        "entry": entry_price,
+                        "exit": exit_price,
+                        "qty": qty,
+                        "pnl": pnl,
+                        "r": r_multiple,
+                        "outcome": "WIN",
+                    }
                 )
 
                 equity += pnl
-
-                equity_curve.append(
-                    equity
-                )
+                equity_curve.append(equity)
 
                 in_trade = False
-
                 continue
 
-            # -----------------------------------------------------------------
-            # STOP
-            # -----------------------------------------------------------------
+            # ----------------------------------------------------------
+            # Stop.
+            # ----------------------------------------------------------
 
             if hit_stop:
 
                 exit_price = (
                     stop_price
-                    * (
-                        1
-                        - SLIPPAGE_PCT
-                    )
+                    * (1 - SLIPPAGE_PCT)
                 )
 
-                pnl = close_trade(
-                    trades=trades,
-                    symbol=symbol,
-                    qty=qty,
-                    entry_price=entry_price,
-                    exit_price=exit_price,
-                    risk_dollars=risk_dollars,
-                    outcome="LOSS",
+                pnl = (
+                    qty
+                    * (
+                        exit_price
+                        - entry_price
+                    )
+                    - COMMISSION_PER_TRADE
+                )
+
+                r_multiple = (
+                    pnl / risk_dollars
+                    if risk_dollars > 0
+                    else 0.0
+                )
+
+                trades.append(
+                    {
+                        "symbol": symbol,
+                        "entry": entry_price,
+                        "exit": exit_price,
+                        "qty": qty,
+                        "pnl": pnl,
+                        "r": r_multiple,
+                        "outcome": "LOSS",
+                    }
                 )
 
                 equity += pnl
-
-                equity_curve.append(
-                    equity
-                )
+                equity_curve.append(equity)
 
                 in_trade = False
-
                 continue
 
-        # =====================================================================
+        # ==============================================================
         # NEW ENTRY
-        # =====================================================================
+        # ==============================================================
 
         if not in_trade:
 
+            # ----------------------------------------------------------
+            # ATR diagnostic.
+            # ----------------------------------------------------------
+
+            if "ATR_1M" in df.columns:
+
+                atr_value = row["ATR_1M"]
+
+                if pd.notna(atr_value):
+
+                    try:
+                        atr_float = float(
+                            atr_value
+                        )
+
+                        if (
+                            np.isfinite(atr_float)
+                            and atr_float > 0
+                        ):
+                            valid_atr += 1
+
+                    except Exception:
+                        pass
+
+            # ----------------------------------------------------------
+            # Evaluate V13 signal.
+            # ----------------------------------------------------------
+
             try:
-
-                signal = evaluate_signal(
-                    row
-                )
-
+                signal = evaluate_signal(row)
             except Exception as exc:
 
-                print(
-                    f"[{symbol:<5}] "
-                    f"signal error at "
-                    f"{df.index[i]}: {exc}"
-                )
+                signals_invalid += 1
 
-                equity_curve.append(
-                    equity
-                )
+                if signals_invalid <= 3:
+
+                    print(
+                        f"          SIGNAL ERROR "
+                        f"at row {i}: {exc}"
+                    )
+
+                equity_curve.append(equity)
 
                 continue
 
             if not signal.valid:
 
-                equity_curve.append(
-                    equity
-                )
+                signals_invalid += 1
+
+                equity_curve.append(equity)
 
                 continue
 
-            # -----------------------------------------------------------------
-            # NEXT-BAR EXECUTION
-            # -----------------------------------------------------------------
+            # ----------------------------------------------------------
+            # V13 generated a valid signal.
+            # ----------------------------------------------------------
+
+            signals_valid += 1
+
+            # ----------------------------------------------------------
+            # Next-bar execution.
+            # ----------------------------------------------------------
 
             next_row = df.iloc[i + 1]
 
@@ -649,47 +664,47 @@ def run_backtest(
                 next_row["Open"]
             )
 
-            if not np.isfinite(
-                raw_entry
-            ):
+            if not np.isfinite(raw_entry):
 
-                equity_curve.append(
-                    equity
-                )
+                equity_curve.append(equity)
 
                 continue
 
-            # Buyer receives adverse slippage.
             entry = (
                 raw_entry
-                * (
-                    1
-                    + SLIPPAGE_PCT
+                * (1 + SLIPPAGE_PCT)
+            )
+
+            # ----------------------------------------------------------
+            # ATR.
+            # ----------------------------------------------------------
+
+            try:
+                atr = float(
+                    row["ATR_1M"]
                 )
-            )
+            except Exception:
 
-            # -----------------------------------------------------------------
-            # ATR
-            # -----------------------------------------------------------------
+                exit_errors += 1
 
-            atr = float(
-                row["ATR_1M"]
-            )
+                equity_curve.append(equity)
+
+                continue
 
             if (
                 not np.isfinite(atr)
                 or atr <= 0
             ):
 
-                equity_curve.append(
-                    equity
-                )
+                exit_errors += 1
+
+                equity_curve.append(equity)
 
                 continue
 
-            # -----------------------------------------------------------------
-            # ATR STOP / TARGET
-            # -----------------------------------------------------------------
+            # ----------------------------------------------------------
+            # Exit prices.
+            # ----------------------------------------------------------
 
             try:
 
@@ -698,30 +713,45 @@ def run_backtest(
                     atr,
                 )
 
+                stop = float(
+                    exits["stop"]
+                )
+
+                target = float(
+                    exits["target"]
+                )
+
             except Exception as exc:
 
-                print(
-                    f"[{symbol:<5}] "
-                    f"exit calculation error: {exc}"
-                )
+                exit_errors += 1
 
-                equity_curve.append(
-                    equity
-                )
+                if exit_errors <= 3:
+
+                    print(
+                        f"          EXIT ERROR "
+                        f"at row {i}: {exc}"
+                    )
+
+                equity_curve.append(equity)
 
                 continue
 
-            stop = float(
-                exits["stop"]
-            )
+            if (
+                not np.isfinite(stop)
+                or not np.isfinite(target)
+                or stop <= 0
+                or target <= entry
+            ):
 
-            target = float(
-                exits["target"]
-            )
+                exit_errors += 1
 
-            # -----------------------------------------------------------------
-            # POSITION SIZE
-            # -----------------------------------------------------------------
+                equity_curve.append(equity)
+
+                continue
+
+            # ----------------------------------------------------------
+            # Position size.
+            # ----------------------------------------------------------
 
             qty_candidate = (
                 calculate_position_size(
@@ -733,15 +763,15 @@ def run_backtest(
 
             if qty_candidate <= 0:
 
-                equity_curve.append(
-                    equity
-                )
+                zero_qty += 1
+
+                equity_curve.append(equity)
 
                 continue
 
-            # -----------------------------------------------------------------
-            # CASH LIMIT
-            # -----------------------------------------------------------------
+            # ----------------------------------------------------------
+            # Never exceed available cash.
+            # ----------------------------------------------------------
 
             max_cash_qty = int(
                 equity / entry
@@ -754,15 +784,15 @@ def run_backtest(
 
             if qty_candidate <= 0:
 
-                equity_curve.append(
-                    equity
-                )
+                zero_qty += 1
+
+                equity_curve.append(equity)
 
                 continue
 
-            # -----------------------------------------------------------------
-            # OPEN TRADE
-            # -----------------------------------------------------------------
+            # ----------------------------------------------------------
+            # Open trade.
+            # ----------------------------------------------------------
 
             qty = qty_candidate
 
@@ -778,19 +808,11 @@ def run_backtest(
                 )
             )
 
-            if risk_dollars <= 0:
-
-                equity_curve.append(
-                    equity
-                )
-
-                continue
-
             in_trade = True
 
-    # =========================================================================
-    # FORCE CLOSE OPEN POSITION
-    # =========================================================================
+    # ==================================================================
+    # FORCE CLOSE REMAINING POSITION
+    # ==================================================================
 
     if in_trade:
 
@@ -800,47 +822,66 @@ def run_backtest(
 
         exit_price = (
             final_close
+            * (1 - SLIPPAGE_PCT)
+        )
+
+        pnl = (
+            qty
             * (
-                1
-                - SLIPPAGE_PCT
+                exit_price
+                - entry_price
             )
+            - COMMISSION_PER_TRADE
         )
 
-        outcome = (
-            "WIN"
-            if exit_price > entry_price
-            else "LOSS"
+        r_multiple = (
+            pnl / risk_dollars
+            if risk_dollars > 0
+            else 0.0
         )
 
-        pnl = close_trade(
-            trades=trades,
-            symbol=symbol,
-            qty=qty,
-            entry_price=entry_price,
-            exit_price=exit_price,
-            risk_dollars=risk_dollars,
-            outcome=outcome,
+        trades.append(
+            {
+                "symbol": symbol,
+                "entry": entry_price,
+                "exit": exit_price,
+                "qty": qty,
+                "pnl": pnl,
+                "r": r_multiple,
+                "outcome": (
+                    "WIN"
+                    if pnl > 0
+                    else "LOSS"
+                ),
+            }
         )
 
         equity += pnl
 
         forced_exits += 1
+        equity_curve.append(equity)
 
-        equity_curve.append(
-            equity
-        )
-
-    # =========================================================================
+    # ==================================================================
     # STATISTICS
-    # =========================================================================
+    # ==================================================================
 
-    return calculate_statistics(
-        symbol=symbol,
-        trades=trades,
-        equity_curve=equity_curve,
-        ambiguous_bars=ambiguous_bars,
-        forced_exits=forced_exits,
+    result = calculate_statistics(
+        symbol,
+        trades,
+        equity_curve,
+        ambiguous_bars,
+        forced_exits,
     )
+
+    # Diagnostics.
+    result["rows_checked"] = rows_checked
+    result["valid_atr"] = valid_atr
+    result["signals_valid"] = signals_valid
+    result["signals_invalid"] = signals_invalid
+    result["exit_errors"] = exit_errors
+    result["zero_qty"] = zero_qty
+
+    return result
 
 
 # ============================================================================
@@ -870,9 +911,7 @@ def calculate_statistics(
     ]
 
     win_rate = (
-        len(wins)
-        / total
-        * 100
+        len(wins) / total * 100
         if total
         else 0.0
     )
@@ -883,8 +922,7 @@ def calculate_statistics(
     )
 
     expectancy = (
-        net_pnl
-        / total
+        net_pnl / total
         if total
         else 0.0
     )
@@ -910,30 +948,26 @@ def calculate_statistics(
 
     elif gross_profit > 0:
 
-        profit_factor = float(
-            "inf"
-        )
+        profit_factor = float("inf")
 
     else:
 
         profit_factor = 0.0
 
     avg_r = (
-        float(
-            np.mean(
-                [
-                    trade["r"]
-                    for trade in trades
-                ]
-            )
+        np.mean(
+            [
+                trade["r"]
+                for trade in trades
+            ]
         )
         if trades
         else 0.0
     )
 
-    # =========================================================================
-    # MAX DRAWDOWN
-    # =========================================================================
+    # ------------------------------------------------------------------
+    # Maximum drawdown.
+    # ------------------------------------------------------------------
 
     peak = -math.inf
     max_drawdown = 0.0
@@ -956,11 +990,15 @@ def calculate_statistics(
                 drawdown,
             )
 
-    pf_display = (
-        "inf"
-        if profit_factor == float("inf")
-        else f"{profit_factor:.2f}"
-    )
+    if profit_factor == float("inf"):
+
+        pf_display = "inf"
+
+    else:
+
+        pf_display = (
+            f"{profit_factor:.2f}"
+        )
 
     return {
         "symbol": symbol,
@@ -973,34 +1011,11 @@ def calculate_statistics(
         "profit_factor": profit_factor,
         "pf_display": pf_display,
         "avg_r": avg_r,
-        "max_drawdown": max_drawdown * 100,
+        "max_drawdown": (
+            max_drawdown * 100
+        ),
         "ambiguous_bars": ambiguous_bars,
         "forced_exits": forced_exits,
-    }
-
-
-# ============================================================================
-# EMPTY RESULT
-# ============================================================================
-
-def empty_result(
-    symbol: str,
-) -> Dict[str, Any]:
-
-    return {
-        "symbol": symbol,
-        "trades": 0,
-        "wins": 0,
-        "losses": 0,
-        "win_rate": 0.0,
-        "pnl": 0.0,
-        "expectancy": 0.0,
-        "profit_factor": 0.0,
-        "pf_display": "0.00",
-        "avg_r": 0.0,
-        "max_drawdown": 0.0,
-        "ambiguous_bars": 0,
-        "forced_exits": 0,
     }
 
 
@@ -1013,7 +1028,7 @@ def main() -> None:
     print("=" * 78)
 
     print(
-        "  BULL. BEAR AND BROKE — UNIFIED STRATEGY BACKTEST v13"
+        "  BULL. BEAR AND BROKE — UNIFIED STRATEGY BACKTEST v13.1"
     )
 
     print(
@@ -1030,11 +1045,13 @@ def main() -> None:
 
     for symbol in TICKERS:
 
-        raw = download_data(
-            symbol
-        )
+        raw = download_data(symbol)
 
         if raw.empty:
+
+            print(
+                f"[{symbol:<5}] no usable data"
+            )
 
             results.append(
                 empty_result(symbol)
@@ -1042,15 +1059,18 @@ def main() -> None:
 
             continue
 
-        df = prepare_features(
-            raw
+        print(
+            f"[{symbol:<5}] "
+            f"{len(raw):,} bars | "
+            f"{raw.index[0]} -> {raw.index[-1]}"
         )
+
+        df = prepare_features(raw)
 
         if df.empty:
 
             print(
-                f"[{symbol:<5}] "
-                f"insufficient features"
+                f"[{symbol:<5}] insufficient features"
             )
 
             results.append(
@@ -1058,15 +1078,18 @@ def main() -> None:
             )
 
             continue
+
+        indicator_diagnostics(
+            symbol,
+            df,
+        )
 
         result = run_backtest(
             symbol,
             df,
         )
 
-        results.append(
-            result
-        )
+        results.append(result)
 
         print(
             f"[{symbol:<5}] "
@@ -1081,9 +1104,19 @@ def main() -> None:
             f"DD={result['max_drawdown']:>6.2f}%"
         )
 
-    # =========================================================================
+        print(
+            f"          DIAGNOSTICS: "
+            f"rows={result['rows_checked']} | "
+            f"ATR-valid={result['valid_atr']} | "
+            f"valid-signals={result['signals_valid']} | "
+            f"invalid-signals={result['signals_invalid']} | "
+            f"exit-errors={result['exit_errors']} | "
+            f"zero-qty={result['zero_qty']}"
+        )
+
+    # ==================================================================
     # PORTFOLIO SUMMARY
-    # =========================================================================
+    # ==================================================================
 
     total_trades = sum(
         result["trades"]
@@ -1106,26 +1139,19 @@ def main() -> None:
     )
 
     total_expectancy = (
-        total_pnl
-        / total_trades
+        total_pnl / total_trades
         if total_trades
         else 0.0
     )
 
     gross_profit = sum(
-        max(
-            result["pnl"],
-            0,
-        )
+        max(result["pnl"], 0)
         for result in results
     )
 
     gross_loss = abs(
         sum(
-            min(
-                result["pnl"],
-                0,
-            )
+            min(result["pnl"], 0)
             for result in results
         )
     )
@@ -1139,9 +1165,7 @@ def main() -> None:
 
     elif gross_profit > 0:
 
-        portfolio_pf = float(
-            "inf"
-        )
+        portfolio_pf = float("inf")
 
     else:
 
@@ -1165,11 +1189,30 @@ def main() -> None:
         for result in results
     )
 
+    valid_signals = sum(
+        result["signals_valid"]
+        for result in results
+    )
+
+    invalid_signals = sum(
+        result["signals_invalid"]
+        for result in results
+    )
+
+    zero_qty = sum(
+        result["zero_qty"]
+        for result in results
+    )
+
+    exit_errors = sum(
+        result["exit_errors"]
+        for result in results
+    )
+
     print("-" * 78)
 
     print(
-        f"TOTAL TRADES: "
-        f"{total_trades}"
+        f"TOTAL TRADES: {total_trades}"
     )
 
     print(
@@ -1206,6 +1249,26 @@ def main() -> None:
         )
 
     print(
+        f"VALID V13 SIGNALS: "
+        f"{valid_signals}"
+    )
+
+    print(
+        f"INVALID SIGNAL CHECKS: "
+        f"{invalid_signals}"
+    )
+
+    print(
+        f"ZERO POSITION-SIZE SIGNALS: "
+        f"{zero_qty}"
+    )
+
+    print(
+        f"EXIT CALCULATION ERRORS: "
+        f"{exit_errors}"
+    )
+
+    print(
         f"AMBIGUOUS TP/SL BARS: "
         f"{ambiguous}"
     )
@@ -1217,9 +1280,9 @@ def main() -> None:
 
     print("=" * 78)
 
-    # =========================================================================
-    # INTERPRETATION
-    # =========================================================================
+    # ==================================================================
+    # DIAGNOSIS
+    # ==================================================================
 
     if total_trades == 0:
 
@@ -1227,56 +1290,70 @@ def main() -> None:
             "❌ NO TRADES WERE GENERATED."
         )
 
+        if valid_signals == 0:
+
+            print(
+                "   V13 generated ZERO valid signals."
+            )
+
+            print(
+                "   This means the problem is upstream of execution."
+            )
+
+            print(
+                "   Inspect the V13 indicator/signal conditions."
+            )
+
+        elif zero_qty > 0:
+
+            print(
+                "   V13 generated valid signals, "
+                "but position sizing rejected them."
+            )
+
+            print(
+                "   The likely issue is the $1,000 account "
+                "combined with risk/position constraints."
+            )
+
+        elif exit_errors > 0:
+
+            print(
+                "   V13 generated signals, "
+                "but exit prices could not be calculated."
+            )
+
+        else:
+
+            print(
+                "   Signals existed but were not converted "
+                "into completed trades."
+            )
+
+    elif total_expectancy > 0 and portfolio_pf > 1:
+
         print(
-            "This is NOT evidence that V13 loses."
+            "✅ V13.1 produced positive historical expectancy."
         )
 
         print(
-            "Check strategy.py indicators/signals and the available "
-            "Yahoo data window."
-        )
-
-    elif total_trades < 50:
-
-        print(
-            f"⚠️ Sample size is very small "
-            f"({total_trades} trades)."
-        )
-
-        print(
-            "Do NOT conclude that V13 beats or loses to V12 "
-            "from this sample alone."
-        )
-
-    elif total_expectancy <= 0:
-
-        print(
-            "❌ V13 is negative expectancy "
-            "on this test window."
-        )
-
-    elif portfolio_pf <= 1.0:
-
-        print(
-            "⚠️ V13 has positive P&L but "
-            "profit factor <= 1.0."
+            "   This is NOT proof of future profitability."
         )
 
     else:
 
         print(
-            "✅ V13 shows positive historical "
-            "expectancy on this test window."
+            "⚠️ V13 generated trades, "
+            "but the tested result is not profitable."
         )
 
     print(
-        "IMPORTANT: Historical performance does not "
-        "guarantee future performance."
+        "IMPORTANT: This is a short historical 1-minute test."
     )
 
     print(
-        "Use a separate out-of-sample test before "
-        "judging V13."
+        "Do NOT compare it directly with V12's larger sample "
+        "until the testing windows are made comparable."
     )
 
     print("=" * 78)
