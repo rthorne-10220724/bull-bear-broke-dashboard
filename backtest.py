@@ -1,396 +1,1295 @@
 """
-BULL. BEAR AND BROKE - V13.2 STRATEGY
+BULL. BEAR AND BROKE - V13.2 BACKTEST
 =====================================
 
-V13.2 FIX:
-    - 1M execution
-    - 15M confirmation calculated from real 15M data
-    - 4H regime calculated from real 4H data
-    - No fake 4H EMA built from a 7-day 1M window
-    - Long-only
-    - ATR-based stop/target
+V13.2 DATA FIX:
 
-The signal engine deliberately stays conservative.
-V13.2 is primarily a DATA / TIMEFRAME integrity correction.
+    4H regime  -> downloaded/calculated on real 4H candles
+    15M signal -> downloaded/calculated on real 15M candles
+    1M entry   -> downloaded separately
+
+This avoids trying to create a 20-period 4H EMA from only seven days
+of 1-minute data.
+
+Execution:
+    - Signal on completed 1M bar
+    - Entry on next 1M bar open
+    - ATR stop
+    - ATR target
+    - Slippage
+    - Commission
+    - Conservative same-bar ambiguity
+    - Forced end-of-data exit
+    - Risk-based position sizing
+
+IMPORTANT:
+    Historical performance is not a guarantee of future results.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import math
+from typing import Any, Dict, List
+
 import numpy as np
 import pandas as pd
+import yfinance as yf
+
+from strategy import (
+    align_timeframes,
+    evaluate_signal,
+    calculate_exit_prices,
+)
 
 
 # ============================================================================
 # CONFIG
 # ============================================================================
 
-ATR_PERIOD = 14
+TICKERS = [
+    "SPY",
+    "QQQ",
+    "AAPL",
+    "NVDA",
+    "AMD",
+    "MSFT",
+    "TSLA",
+    "MSTR",
+    "COIN",
+    "MARA",
+    "RIOT",
+]
 
-RSI_PERIOD = 14
+# Yahoo generally limits 1m historical data.
+EXECUTION_PERIOD = "7d"
 
-MACD_FAST = 12
-MACD_SLOW = 26
-MACD_SIGNAL = 9
+# Higher timeframes can go much farther back.
+HIGHER_PERIOD = "180d"
 
-EMA_4H_PERIOD = 20
+STARTING_CAPITAL = 1000.0
 
-ATR_STOP_MULT = 1.25
-ATR_TARGET_MULT = 2.00
+SLIPPAGE_PCT = 0.0005
 
-RSI_MIN = 52.0
-RSI_MAX = 72.0
+COMMISSION_PER_TRADE = 0.0
 
+RISK_PER_TRADE_PCT = 0.0075
 
-# ============================================================================
-# SIGNAL
-# ============================================================================
+MAX_POSITION_PCT = 0.25
 
-@dataclass
-class Signal:
-    valid: bool
-    reason: str = ""
-
-
-# ============================================================================
-# HELPERS
-# ============================================================================
-
-def _ema(series: pd.Series, period: int) -> pd.Series:
-    return series.ewm(
-        span=period,
-        adjust=False,
-        min_periods=period,
-    ).mean()
-
-
-def _rsi(close: pd.Series, period: int = 14) -> pd.Series:
-
-    delta = close.diff()
-
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-
-    avg_gain = gain.ewm(
-        alpha=1 / period,
-        adjust=False,
-        min_periods=period,
-    ).mean()
-
-    avg_loss = loss.ewm(
-        alpha=1 / period,
-        adjust=False,
-        min_periods=period,
-    ).mean()
-
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-
-    return 100 - (100 / (1 + rs))
-
-
-def _atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-
-    previous_close = df["Close"].shift(1)
-
-    tr = pd.concat(
-        [
-            df["High"] - df["Low"],
-            (df["High"] - previous_close).abs(),
-            (df["Low"] - previous_close).abs(),
-        ],
-        axis=1,
-    ).max(axis=1)
-
-    return tr.ewm(
-        alpha=1 / period,
-        adjust=False,
-        min_periods=period,
-    ).mean()
+WARMUP_BARS = 100
 
 
 # ============================================================================
-# 1-MINUTE INDICATORS
+# DOWNLOAD
 # ============================================================================
 
-def calculate_1m_indicators(
-    df: pd.DataFrame,
+def download_data(
+    symbol: str,
+    period: str,
+    interval: str,
 ) -> pd.DataFrame:
 
-    out = df.copy()
-
-    out["ATR_1M"] = _atr(
-        out,
-        ATR_PERIOD,
+    df = yf.download(
+        symbol,
+        period=period,
+        interval=interval,
+        auto_adjust=False,
+        progress=False,
+        prepost=False,
     )
 
-    out["RSI_1M"] = _rsi(
-        out["Close"],
-        RSI_PERIOD,
-    )
+    if df.empty:
+        return pd.DataFrame()
 
-    return out
+    # Flatten yfinance MultiIndex.
+    if isinstance(df.columns, pd.MultiIndex):
 
+        if symbol in df.columns.get_level_values(-1):
 
-# ============================================================================
-# 15-MINUTE INDICATORS
-# ============================================================================
+            df = df.xs(
+                symbol,
+                level=-1,
+                axis=1,
+            )
 
-def calculate_15m_indicators(
-    df: pd.DataFrame,
-) -> pd.DataFrame:
+        elif symbol in df.columns.get_level_values(0):
 
-    out = df.copy()
+            df = df.xs(
+                symbol,
+                level=0,
+                axis=1,
+            )
 
-    fast = _ema(
-        out["Close"],
-        MACD_FAST,
-    )
+        else:
 
-    slow = _ema(
-        out["Close"],
-        MACD_SLOW,
-    )
-
-    macd = fast - slow
-
-    signal = _ema(
-        macd,
-        MACD_SIGNAL,
-    )
-
-    out["MACD_15M"] = macd
-    out["MACD_SIGNAL_15M"] = signal
-    out["MACD_DIFF_15M"] = macd - signal
-
-    return out
-
-
-# ============================================================================
-# 4-HOUR INDICATORS
-# ============================================================================
-
-def calculate_4h_indicators(
-    df: pd.DataFrame,
-) -> pd.DataFrame:
-
-    out = df.copy()
-
-    out["EMA20_4H"] = _ema(
-        out["Close"],
-        EMA_4H_PERIOD,
-    )
-
-    return out
-
-
-# ============================================================================
-# ALIGN MULTI-TIMEFRAME DATA
-# ============================================================================
-
-def align_timeframes(
-    df_1m: pd.DataFrame,
-    df_15m: pd.DataFrame,
-    df_4h: pd.DataFrame,
-) -> pd.DataFrame:
-
-    one = calculate_1m_indicators(
-        df_1m
-    )
-
-    fifteen = calculate_15m_indicators(
-        df_15m
-    )
-
-    four = calculate_4h_indicators(
-        df_4h
-    )
-
-    # Only use completed higher-timeframe candles.
-    fifteen = fifteen[
-        [
-            "MACD_15M",
-            "MACD_SIGNAL_15M",
-            "MACD_DIFF_15M",
-        ]
-    ].copy()
-
-    four = four[
-        [
-            "EMA20_4H",
-        ]
-    ].copy()
-
-    # Shift higher timeframe values one candle.
-    # This prevents using a currently-forming 15M/4H candle.
-    fifteen = fifteen.shift(1)
-    four = four.shift(1)
-
-    one = pd.merge_asof(
-        one.sort_index(),
-        fifteen.sort_index(),
-        left_index=True,
-        right_index=True,
-        direction="backward",
-    )
-
-    one = pd.merge_asof(
-        one.sort_index(),
-        four.sort_index(),
-        left_index=True,
-        right_index=True,
-        direction="backward",
-    )
-
-    return one
-
-
-# ============================================================================
-# BACKWARD-COMPATIBILITY WRAPPER
-# ============================================================================
-
-def calculate_indicators(
-    df: pd.DataFrame,
-) -> pd.DataFrame:
-
-    """
-    Compatibility helper.
-
-    This function can still be called by older code, but it only calculates
-    native 1M indicators. V13.2 backtest should use align_timeframes().
-    """
-
-    return calculate_1m_indicators(df)
-
-
-# ============================================================================
-# SIGNAL ENGINE
-# ============================================================================
-
-def evaluate_signal(
-    row: pd.Series,
-) -> Signal:
+            # Fallback to first ticker level.
+            df.columns = [
+                column[0]
+                for column in df.columns
+            ]
 
     required = [
+        "Open",
+        "High",
+        "Low",
         "Close",
-        "ATR_1M",
-        "RSI_1M",
-        "MACD_DIFF_15M",
-        "EMA20_4H",
+        "Volume",
     ]
+
+    if not all(
+        column in df.columns
+        for column in required
+    ):
+        return pd.DataFrame()
+
+    df = df[required].copy()
 
     for column in required:
 
-        value = row.get(column, np.nan)
-
-        if not np.isfinite(value):
-
-            return Signal(
-                False,
-                f"missing_{column}",
-            )
-
-    close = float(row["Close"])
-    atr = float(row["ATR_1M"])
-    rsi = float(row["RSI_1M"])
-    macd_diff = float(row["MACD_DIFF_15M"])
-    ema20_4h = float(row["EMA20_4H"])
-
-    if close <= 0:
-        return Signal(False, "invalid_close")
-
-    if atr <= 0:
-        return Signal(False, "invalid_atr")
-
-    # ------------------------------------------------------------------------
-    # V13 regime:
-    # Price must be above completed 4H EMA20.
-    # ------------------------------------------------------------------------
-
-    regime_ok = (
-        close > ema20_4h
-    )
-
-    if not regime_ok:
-        return Signal(False, "below_4h_ema")
-
-    # ------------------------------------------------------------------------
-    # 15M momentum confirmation.
-    # ------------------------------------------------------------------------
-
-    momentum_ok = (
-        macd_diff > 0
-    )
-
-    if not momentum_ok:
-        return Signal(False, "negative_15m_macd")
-
-    # ------------------------------------------------------------------------
-    # 1M RSI confirmation.
-    # ------------------------------------------------------------------------
-
-    rsi_ok = (
-        RSI_MIN <= rsi <= RSI_MAX
-    )
-
-    if not rsi_ok:
-        return Signal(False, "rsi_filter")
-
-    # ------------------------------------------------------------------------
-    # Avoid extremely stretched candles.
-    # ------------------------------------------------------------------------
-
-    candle_range = (
-        float(row["High"])
-        - float(row["Low"])
-    )
-
-    if candle_range > 3.0 * atr:
-        return Signal(
-            False,
-            "oversized_candle",
+        df[column] = pd.to_numeric(
+            df[column],
+            errors="coerce",
         )
 
-    return Signal(
-        True,
-        "V13.2_LONG",
+    df.dropna(
+        subset=[
+            "Open",
+            "High",
+            "Low",
+            "Close",
+        ],
+        inplace=True,
     )
 
+    df.sort_index(
+        inplace=True
+    )
+
+    df = df[
+        ~df.index.duplicated(
+            keep="last"
+        )
+    ]
+
+    return df
+
 
 # ============================================================================
-# EXIT PRICES
+# POSITION SIZE
 # ============================================================================
 
-def calculate_exit_prices(
+def calculate_position_size(
+    equity: float,
     entry_price: float,
-    atr: float,
-) -> dict:
+    stop_price: float,
+) -> int:
 
     if (
-        not np.isfinite(entry_price)
-        or not np.isfinite(atr)
+        equity <= 0
         or entry_price <= 0
-        or atr <= 0
+        or stop_price <= 0
     ):
-        raise ValueError(
-            "Invalid entry price or ATR."
-        )
+        return 0
 
-    stop = (
+    risk_per_share = (
         entry_price
-        - ATR_STOP_MULT * atr
+        - stop_price
     )
 
-    target = (
-        entry_price
-        + ATR_TARGET_MULT * atr
+    if risk_per_share <= 0:
+        return 0
+
+    risk_dollars = (
+        equity
+        * RISK_PER_TRADE_PCT
     )
 
-    if stop <= 0:
-        raise ValueError(
-            "Calculated stop is not positive."
-        )
+    qty_by_risk = (
+        risk_dollars
+        / risk_per_share
+    )
+
+    max_position_dollars = (
+        equity
+        * MAX_POSITION_PCT
+    )
+
+    qty_by_cap = (
+        max_position_dollars
+        / entry_price
+    )
+
+    qty = min(
+        qty_by_risk,
+        qty_by_cap,
+    )
+
+    return max(
+        0,
+        int(qty),
+    )
+
+
+# ============================================================================
+# EMPTY RESULT
+# ============================================================================
+
+def empty_result(
+    symbol: str,
+) -> Dict[str, Any]:
 
     return {
-        "stop": float(stop),
-        "target": float(target),
+        "symbol": symbol,
+        "trades": 0,
+        "wins": 0,
+        "losses": 0,
+        "win_rate": 0.0,
+        "pnl": 0.0,
+        "expectancy": 0.0,
+        "profit_factor": 0.0,
+        "pf_display": "0.00",
+        "avg_r": 0.0,
+        "max_drawdown": 0.0,
+        "ambiguous_bars": 0,
+        "forced_exits": 0,
+        "signal_valid": 0,
+        "signal_invalid": 0,
+        "zero_qty": 0,
+        "exit_errors": 0,
     }
+
+
+# ============================================================================
+# BACKTEST
+# ============================================================================
+
+def run_backtest(
+    symbol: str,
+    df: pd.DataFrame,
+) -> Dict[str, Any]:
+
+    if df.empty:
+        return empty_result(symbol)
+
+    equity = STARTING_CAPITAL
+
+    trades: List[Dict[str, Any]] = []
+
+    equity_curve = [
+        equity
+    ]
+
+    in_trade = False
+
+    qty = 0
+
+    entry_price = 0.0
+    stop_price = 0.0
+    target_price = 0.0
+    risk_dollars = 0.0
+
+    ambiguous_bars = 0
+    forced_exits = 0
+
+    signal_valid = 0
+    signal_invalid = 0
+    zero_qty = 0
+    exit_errors = 0
+
+    for i in range(
+        WARMUP_BARS,
+        len(df) - 1,
+    ):
+
+        row = df.iloc[i]
+
+        # ====================================================================
+        # MANAGE OPEN POSITION
+        # ====================================================================
+
+        if in_trade:
+
+            high = float(row["High"])
+            low = float(row["Low"])
+
+            hit_stop = (
+                low <= stop_price
+            )
+
+            hit_target = (
+                high >= target_price
+            )
+
+            # ---------------------------------------------------------------
+            # Conservative ambiguity handling:
+            # If both stop and target were touched in one candle,
+            # assume stop happened first.
+            # ---------------------------------------------------------------
+
+            if hit_stop and hit_target:
+
+                ambiguous_bars += 1
+
+                exit_price = (
+                    stop_price
+                    * (1 - SLIPPAGE_PCT)
+                )
+
+                pnl = (
+                    qty
+                    * (
+                        exit_price
+                        - entry_price
+                    )
+                    - COMMISSION_PER_TRADE
+                )
+
+                r_multiple = (
+                    pnl / risk_dollars
+                    if risk_dollars > 0
+                    else 0.0
+                )
+
+                trades.append(
+                    {
+                        "symbol": symbol,
+                        "entry": entry_price,
+                        "exit": exit_price,
+                        "qty": qty,
+                        "pnl": pnl,
+                        "r": r_multiple,
+                        "outcome": "LOSS",
+                    }
+                )
+
+                equity += pnl
+                equity_curve.append(
+                    equity
+                )
+
+                in_trade = False
+                continue
+
+            # ---------------------------------------------------------------
+            # TARGET
+            # ---------------------------------------------------------------
+
+            if hit_target:
+
+                exit_price = (
+                    target_price
+                    * (1 - SLIPPAGE_PCT)
+                )
+
+                pnl = (
+                    qty
+                    * (
+                        exit_price
+                        - entry_price
+                    )
+                    - COMMISSION_PER_TRADE
+                )
+
+                r_multiple = (
+                    pnl / risk_dollars
+                    if risk_dollars > 0
+                    else 0.0
+                )
+
+                trades.append(
+                    {
+                        "symbol": symbol,
+                        "entry": entry_price,
+                        "exit": exit_price,
+                        "qty": qty,
+                        "pnl": pnl,
+                        "r": r_multiple,
+                        "outcome": "WIN",
+                    }
+                )
+
+                equity += pnl
+                equity_curve.append(
+                    equity
+                )
+
+                in_trade = False
+                continue
+
+            # ---------------------------------------------------------------
+            # STOP
+            # ---------------------------------------------------------------
+
+            if hit_stop:
+
+                exit_price = (
+                    stop_price
+                    * (1 - SLIPPAGE_PCT)
+                )
+
+                pnl = (
+                    qty
+                    * (
+                        exit_price
+                        - entry_price
+                    )
+                    - COMMISSION_PER_TRADE
+                )
+
+                r_multiple = (
+                    pnl / risk_dollars
+                    if risk_dollars > 0
+                    else 0.0
+                )
+
+                trades.append(
+                    {
+                        "symbol": symbol,
+                        "entry": entry_price,
+                        "exit": exit_price,
+                        "qty": qty,
+                        "pnl": pnl,
+                        "r": r_multiple,
+                        "outcome": "LOSS",
+                    }
+                )
+
+                equity += pnl
+                equity_curve.append(
+                    equity
+                )
+
+                in_trade = False
+                continue
+
+        # ====================================================================
+        # NEW ENTRY
+        # ====================================================================
+
+        if not in_trade:
+
+            signal = evaluate_signal(
+                row
+            )
+
+            if not signal.valid:
+
+                signal_invalid += 1
+
+                equity_curve.append(
+                    equity
+                )
+
+                continue
+
+            signal_valid += 1
+
+            # ---------------------------------------------------------------
+            # NEXT-BAR EXECUTION
+            # ---------------------------------------------------------------
+
+            next_row = df.iloc[i + 1]
+
+            raw_entry = float(
+                next_row["Open"]
+            )
+
+            if not np.isfinite(
+                raw_entry
+            ):
+
+                equity_curve.append(
+                    equity
+                )
+
+                continue
+
+            # Buyer pays adverse slippage.
+            entry = (
+                raw_entry
+                * (1 + SLIPPAGE_PCT)
+            )
+
+            atr = float(
+                row["ATR_1M"]
+            )
+
+            if (
+                not np.isfinite(atr)
+                or atr <= 0
+            ):
+
+                signal_invalid += 1
+
+                equity_curve.append(
+                    equity
+                )
+
+                continue
+
+            # ---------------------------------------------------------------
+            # EXITS
+            # ---------------------------------------------------------------
+
+            try:
+
+                exits = calculate_exit_prices(
+                    entry,
+                    atr,
+                )
+
+            except Exception:
+
+                exit_errors += 1
+
+                equity_curve.append(
+                    equity
+                )
+
+                continue
+
+            stop = exits["stop"]
+            target = exits["target"]
+
+            # ---------------------------------------------------------------
+            # SIZE
+            # ---------------------------------------------------------------
+
+            qty_candidate = (
+                calculate_position_size(
+                    equity=equity,
+                    entry_price=entry,
+                    stop_price=stop,
+                )
+            )
+
+            if qty_candidate <= 0:
+
+                zero_qty += 1
+
+                equity_curve.append(
+                    equity
+                )
+
+                continue
+
+            # Never exceed available cash.
+            max_cash_qty = int(
+                equity / entry
+            )
+
+            qty_candidate = min(
+                qty_candidate,
+                max_cash_qty,
+            )
+
+            if qty_candidate <= 0:
+
+                zero_qty += 1
+
+                equity_curve.append(
+                    equity
+                )
+
+                continue
+
+            qty = qty_candidate
+
+            entry_price = entry
+            stop_price = stop
+            target_price = target
+
+            risk_dollars = (
+                qty
+                * (
+                    entry_price
+                    - stop_price
+                )
+            )
+
+            in_trade = True
+
+    # ========================================================================
+    # FORCE END-OF-DATA EXIT
+    # ========================================================================
+
+    if in_trade:
+
+        final_close = float(
+            df["Close"].iloc[-1]
+        )
+
+        exit_price = (
+            final_close
+            * (1 - SLIPPAGE_PCT)
+        )
+
+        pnl = (
+            qty
+            * (
+                exit_price
+                - entry_price
+            )
+            - COMMISSION_PER_TRADE
+        )
+
+        r_multiple = (
+            pnl / risk_dollars
+            if risk_dollars > 0
+            else 0.0
+        )
+
+        trades.append(
+            {
+                "symbol": symbol,
+                "entry": entry_price,
+                "exit": exit_price,
+                "qty": qty,
+                "pnl": pnl,
+                "r": r_multiple,
+                "outcome": (
+                    "WIN"
+                    if pnl > 0
+                    else "LOSS"
+                ),
+            }
+        )
+
+        equity += pnl
+
+        equity_curve.append(
+            equity
+        )
+
+        forced_exits += 1
+
+    # ========================================================================
+    # STATISTICS
+    # ========================================================================
+
+    return calculate_statistics(
+        symbol=symbol,
+        trades=trades,
+        equity_curve=equity_curve,
+        ambiguous_bars=ambiguous_bars,
+        forced_exits=forced_exits,
+        signal_valid=signal_valid,
+        signal_invalid=signal_invalid,
+        zero_qty=zero_qty,
+        exit_errors=exit_errors,
+    )
+
+
+# ============================================================================
+# STATISTICS
+# ============================================================================
+
+def calculate_statistics(
+    symbol: str,
+    trades: List[Dict[str, Any]],
+    equity_curve: List[float],
+    ambiguous_bars: int,
+    forced_exits: int,
+    signal_valid: int,
+    signal_invalid: int,
+    zero_qty: int,
+    exit_errors: int,
+) -> Dict[str, Any]:
+
+    total = len(trades)
+
+    wins = [
+        trade
+        for trade in trades
+        if trade["pnl"] > 0
+    ]
+
+    losses = [
+        trade
+        for trade in trades
+        if trade["pnl"] <= 0
+    ]
+
+    win_rate = (
+        len(wins) / total * 100
+        if total
+        else 0.0
+    )
+
+    net_pnl = sum(
+        trade["pnl"]
+        for trade in trades
+    )
+
+    expectancy = (
+        net_pnl / total
+        if total
+        else 0.0
+    )
+
+    gross_profit = sum(
+        trade["pnl"]
+        for trade in wins
+    )
+
+    gross_loss = abs(
+        sum(
+            trade["pnl"]
+            for trade in losses
+        )
+    )
+
+    if gross_loss > 0:
+
+        profit_factor = (
+            gross_profit
+            / gross_loss
+        )
+
+    elif gross_profit > 0:
+
+        profit_factor = float("inf")
+
+    else:
+
+        profit_factor = 0.0
+
+    avg_r = (
+        np.mean(
+            [
+                trade["r"]
+                for trade in trades
+            ]
+        )
+        if trades
+        else 0.0
+    )
+
+    # ------------------------------------------------------------------------
+    # Drawdown
+    # ------------------------------------------------------------------------
+
+    peak = -math.inf
+    max_drawdown = 0.0
+
+    for value in equity_curve:
+
+        peak = max(
+            peak,
+            value,
+        )
+
+        if peak > 0:
+
+            drawdown = (
+                value - peak
+            ) / peak
+
+            max_drawdown = min(
+                max_drawdown,
+                drawdown,
+            )
+
+    pf_display = (
+        "inf"
+        if profit_factor == float("inf")
+        else f"{profit_factor:.2f}"
+    )
+
+    return {
+        "symbol": symbol,
+        "trades": total,
+        "wins": len(wins),
+        "losses": len(losses),
+        "win_rate": win_rate,
+        "pnl": net_pnl,
+        "expectancy": expectancy,
+        "profit_factor": profit_factor,
+        "pf_display": pf_display,
+        "avg_r": avg_r,
+        "max_drawdown": max_drawdown * 100,
+        "ambiguous_bars": ambiguous_bars,
+        "forced_exits": forced_exits,
+        "signal_valid": signal_valid,
+        "signal_invalid": signal_invalid,
+        "zero_qty": zero_qty,
+        "exit_errors": exit_errors,
+    }
+
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+def main() -> None:
+
+    print("=" * 78)
+
+    print(
+        "  BULL. BEAR AND BROKE — UNIFIED STRATEGY BACKTEST v13.2"
+    )
+
+    print(
+        "  4H regime | 15M confirmation | 1M execution | ATR exits"
+    )
+
+    print(
+        f"  4H/15M history: {HIGHER_PERIOD}"
+    )
+
+    print(
+        f"  1M execution window: {EXECUTION_PERIOD}"
+    )
+
+    print("=" * 78)
+
+    results: List[Dict[str, Any]] = []
+
+    for symbol in TICKERS:
+
+        print(
+            f"[{symbol:<5}] downloading 1M execution data..."
+        )
+
+        one_minute = download_data(
+            symbol,
+            EXECUTION_PERIOD,
+            "1m",
+        )
+
+        if one_minute.empty:
+
+            print(
+                f"[{symbol:<5}] no 1M data"
+            )
+
+            results.append(
+                empty_result(symbol)
+            )
+
+            continue
+
+        print(
+            f"[{symbol:<5}] "
+            f"{len(one_minute):,} 1M bars | "
+            f"{one_minute.index[0]} -> "
+            f"{one_minute.index[-1]}"
+        )
+
+        print(
+            f"          downloading 15M confirmation..."
+        )
+
+        fifteen_minute = download_data(
+            symbol,
+            HIGHER_PERIOD,
+            "15m",
+        )
+
+        if fifteen_minute.empty:
+
+            print(
+                f"[{symbol:<5}] no 15M data"
+            )
+
+            results.append(
+                empty_result(symbol)
+            )
+
+            continue
+
+        print(
+            f"          {len(fifteen_minute):,} 15M bars"
+        )
+
+        print(
+            f"          downloading 4H regime..."
+        )
+
+        four_hour = download_data(
+            symbol,
+            HIGHER_PERIOD,
+            "1h",
+        )
+
+        if four_hour.empty:
+
+            print(
+                f"[{symbol:<5}] no 1H data for 4H construction"
+            )
+
+            results.append(
+                empty_result(symbol)
+            )
+
+            continue
+
+        # --------------------------------------------------------------------
+        # Build actual 4H candles from 1H candles.
+        #
+        # This gives us enough history for EMA20_4H.
+        # --------------------------------------------------------------------
+
+        four_hour = (
+            four_hour
+            .resample("4h")
+            .agg(
+                {
+                    "Open": "first",
+                    "High": "max",
+                    "Low": "min",
+                    "Close": "last",
+                    "Volume": "sum",
+                }
+            )
+            .dropna(
+                subset=[
+                    "Open",
+                    "High",
+                    "Low",
+                    "Close",
+                ]
+            )
+        )
+
+        print(
+            f"          {len(four_hour):,} 4H bars"
+        )
+
+        # --------------------------------------------------------------------
+        # Align all timeframes.
+        # --------------------------------------------------------------------
+
+        print(
+            f"          calculating V13.2 indicators..."
+        )
+
+        try:
+
+            df = align_timeframes(
+                df_1m=one_minute,
+                df_15m=fifteen_minute,
+                df_4h=four_hour,
+            )
+
+        except Exception as exc:
+
+            print(
+                f"[{symbol:<5}] indicator error: {exc}"
+            )
+
+            results.append(
+                empty_result(symbol)
+            )
+
+            continue
+
+        # --------------------------------------------------------------------
+        # Diagnostics
+        # --------------------------------------------------------------------
+
+        total_rows = len(df)
+
+        atr_valid = int(
+            df["ATR_1M"]
+            .notna()
+            .sum()
+        )
+
+        rsi_valid = int(
+            df["RSI_1M"]
+            .notna()
+            .sum()
+        )
+
+        macd_valid = int(
+            df["MACD_DIFF_15M"]
+            .notna()
+            .sum()
+        )
+
+        ema_valid = int(
+            df["EMA20_4H"]
+            .notna()
+            .sum()
+        )
+
+        print(
+            f"          [{symbol}] INDICATOR DIAGNOSTICS"
+        )
+
+        print(
+            f"          ATR_1M        "
+            f"{atr_valid}/{total_rows} "
+            f"valid "
+            f"({atr_valid / total_rows * 100:5.1f}%)"
+        )
+
+        print(
+            f"          RSI_1M        "
+            f"{rsi_valid}/{total_rows} "
+            f"valid "
+            f"({rsi_valid / total_rows * 100:5.1f}%)"
+        )
+
+        print(
+            f"          MACD_DIFF_15M "
+            f"{macd_valid}/{total_rows} "
+            f"valid "
+            f"({macd_valid / total_rows * 100:5.1f}%)"
+        )
+
+        print(
+            f"          EMA20_4H      "
+            f"{ema_valid}/{total_rows} "
+            f"valid "
+            f"({ema_valid / total_rows * 100:5.1f}%)"
+        )
+
+        result = run_backtest(
+            symbol,
+            df,
+        )
+
+        results.append(
+            result
+        )
+
+        print(
+            f"[{symbol:<5}] "
+            f"Trades={result['trades']:<3} | "
+            f"W={result['wins']:<3} | "
+            f"L={result['losses']:<3} | "
+            f"Win={result['win_rate']:>5.1f}% | "
+            f"P&L=${result['pnl']:>8.2f} | "
+            f"Exp=${result['expectancy']:>7.2f} | "
+            f"PF={result['pf_display']:>5} | "
+            f"AvgR={result['avg_r']:>6.3f} | "
+            f"DD={result['max_drawdown']:>6.2f}%"
+        )
+
+        print(
+            f"          DIAGNOSTICS: "
+            f"valid-signals={result['signal_valid']} | "
+            f"invalid-signals={result['signal_invalid']} | "
+            f"zero-qty={result['zero_qty']} | "
+            f"exit-errors={result['exit_errors']}"
+        )
+
+    # =========================================================================
+    # PORTFOLIO SUMMARY
+    # =========================================================================
+
+    total_trades = sum(
+        result["trades"]
+        for result in results
+    )
+
+    total_wins = sum(
+        result["wins"]
+        for result in results
+    )
+
+    total_losses = sum(
+        result["losses"]
+        for result in results
+    )
+
+    total_pnl = sum(
+        result["pnl"]
+        for result in results
+    )
+
+    total_expectancy = (
+        total_pnl / total_trades
+        if total_trades
+        else 0.0
+    )
+
+    gross_profit = sum(
+        max(
+            result["pnl"],
+            0,
+        )
+        for result in results
+    )
+
+    gross_loss = abs(
+        sum(
+            min(
+                result["pnl"],
+                0,
+            )
+            for result in results
+        )
+    )
+
+    if gross_loss > 0:
+
+        portfolio_pf = (
+            gross_profit
+            / gross_loss
+        )
+
+    elif gross_profit > 0:
+
+        portfolio_pf = float("inf")
+
+    else:
+
+        portfolio_pf = 0.0
+
+    portfolio_win_rate = (
+        total_wins
+        / total_trades
+        * 100
+        if total_trades
+        else 0.0
+    )
+
+    ambiguous = sum(
+        result["ambiguous_bars"]
+        for result in results
+    )
+
+    forced = sum(
+        result["forced_exits"]
+        for result in results
+    )
+
+    valid_signals = sum(
+        result["signal_valid"]
+        for result in results
+    )
+
+    invalid_signals = sum(
+        result["signal_invalid"]
+        for result in results
+    )
+
+    zero_qty = sum(
+        result["zero_qty"]
+        for result in results
+    )
+
+    exit_errors = sum(
+        result["exit_errors"]
+        for result in results
+    )
+
+    print("-" * 78)
+
+    print(
+        f"TOTAL TRADES: {total_trades}"
+    )
+
+    print(
+        f"WINS / LOSSES: "
+        f"{total_wins} / {total_losses}"
+    )
+
+    print(
+        f"OVERALL WIN RATE: "
+        f"{portfolio_win_rate:.2f}%"
+    )
+
+    print(
+        f"NET P&L: "
+        f"${total_pnl:.2f}"
+    )
+
+    print(
+        f"EXPECTANCY / TRADE: "
+        f"${total_expectancy:.2f}"
+    )
+
+    print(
+        f"PROFIT FACTOR: "
+        f"{portfolio_pf:.3f}"
+        if portfolio_pf != float("inf")
+        else "PROFIT FACTOR: inf"
+    )
+
+    print(
+        f"VALID V13.2 SIGNALS: "
+        f"{valid_signals}"
+    )
+
+    print(
+        f"INVALID SIGNAL CHECKS: "
+        f"{invalid_signals}"
+    )
+
+    print(
+        f"ZERO POSITION-SIZE SIGNALS: "
+        f"{zero_qty}"
+    )
+
+    print(
+        f"EXIT CALCULATION ERRORS: "
+        f"{exit_errors}"
+    )
+
+    print(
+        f"AMBIGUOUS TP/SL BARS: "
+        f"{ambiguous}"
+    )
+
+    print(
+        f"FORCED END-OF-DATA EXITS: "
+        f"{forced}"
+    )
+
+    print("=" * 78)
+
+    if total_trades == 0:
+
+        print(
+            "❌ NO TRADES WERE GENERATED."
+        )
+
+        print(
+            "This time the diagnostics should tell us "
+            "whether the problem is data or signal logic."
+        )
+
+    elif total_expectancy <= 0:
+
+        print(
+            "❌ V13.2 is NOT profitable on this test."
+        )
+
+    elif portfolio_pf <= 1.0:
+
+        print(
+            "⚠️ Positive P&L but PF <= 1.0."
+        )
+
+    else:
+
+        print(
+            "✅ V13.2 shows positive historical expectancy."
+        )
+
+    if total_trades < 100:
+
+        print(
+            f"⚠️ Sample size is small "
+            f"({total_trades} trades)."
+        )
+
+    print(
+        "IMPORTANT: Historical performance "
+        "does not guarantee future results."
+    )
+
+    print(
+        "Use a separate out-of-sample period "
+        "before judging V13.2."
+    )
+
+    print("=" * 78)
+
+
+if __name__ == "__main__":
+    main()
