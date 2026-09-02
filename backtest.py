@@ -2,24 +2,33 @@
 BULL. BEAR AND BROKE - V13 BACKTEST
 ===================================
 
-Tests the V13 strategy using:
+V13 BACKTESTER
 
-    - 1-minute data
+Tests the existing V13 strategy.py signal engine using:
+
+    - 1-minute execution data
+    - 4H regime
+    - 15M confirmation
     - shared strategy.py signal engine
     - next-bar execution
     - ATR stop
     - ATR target
     - slippage
     - commissions
-    - same-bar ambiguity handling
+    - conservative same-bar ambiguity handling
     - forced end-of-data exits
-    - max drawdown
+    - fixed-risk position sizing
+    - maximum drawdown
     - R statistics
 
 IMPORTANT:
-    This is NOT a guarantee of future performance.
+    Yahoo Finance has strict limits on historical 1-minute data.
+    Do NOT request 60d of 1m data.
 
-Use the results to compare V13 against V12.
+    This backtester therefore uses a short 1-minute window that
+    Yahoo can actually supply.
+
+    This is a historical test, NOT a guarantee of future performance.
 """
 
 from __future__ import annotations
@@ -56,62 +65,99 @@ TICKERS = [
     "RIOT",
 ]
 
-PERIOD = "60d"
+# IMPORTANT:
+# Yahoo limits 1-minute historical data.
+#
+# Use a maximum of 7 days so we stay safely inside the
+# commonly enforced 8-day-per-request limitation.
+PERIOD = "7d"
 INTERVAL = "1m"
 
 STARTING_CAPITAL = 1000.0
 
-# Realistic-ish baseline.
-# Change these only when comparing all strategies equally.
+# Buyer pays slightly more on entry.
+# Seller receives slightly less on exit.
 SLIPPAGE_PCT = 0.0005
 
 COMMISSION_PER_TRADE = 0.0
 
-# Position sizing:
-# risk a fixed fraction of account equity per trade.
+# Risk 0.75% of current equity per trade.
 RISK_PER_TRADE_PCT = 0.0075
 
+# Never allocate more than 25% of equity to one position.
 MAX_POSITION_PCT = 0.25
 
-# Minimum data before signal evaluation.
+# Minimum number of bars before signals are considered.
 WARMUP_BARS = 500
 
 
 # ============================================================================
-# DATA
+# DATA DOWNLOAD
 # ============================================================================
 
 def download_data(symbol: str) -> pd.DataFrame:
+    """
+    Download 1-minute OHLCV data from Yahoo Finance.
 
-    print(f"[{symbol:<5}] downloading...")
+    IMPORTANT:
+        Do not change PERIOD to 60d for 1-minute data.
+        Yahoo does not provide that much 1-minute history in a
+        normal request.
+    """
 
-    df = yf.download(
-        symbol,
-        period=PERIOD,
-        interval=INTERVAL,
-        auto_adjust=False,
-        progress=False,
-    )
+    print(f"[{symbol:<5}] downloading {PERIOD} of {INTERVAL} data...")
 
-    if df.empty:
+    try:
+        df = yf.download(
+            symbol,
+            period=PERIOD,
+            interval=INTERVAL,
+            auto_adjust=False,
+            progress=False,
+            prepost=False,
+            threads=False,
+        )
+    except Exception as exc:
+        print(f"[{symbol:<5}] download error: {exc}")
         return pd.DataFrame()
 
-    # Flatten yfinance MultiIndex.
+    if df is None or df.empty:
+        print(f"[{symbol:<5}] no data returned")
+        return pd.DataFrame()
+
+    # ------------------------------------------------------------------------
+    # Flatten yfinance MultiIndex columns.
+    # ------------------------------------------------------------------------
+
     if isinstance(df.columns, pd.MultiIndex):
 
-        if symbol in df.columns.get_level_values(-1):
-            df = df.xs(
-                symbol,
-                level=-1,
-                axis=1,
-            )
+        # Typical yfinance layout:
+        #
+        # Open / High / Low / Close / Volume
+        # with ticker as another level.
+        #
+        # Try to extract this symbol cleanly.
 
-        elif symbol in df.columns.get_level_values(0):
-            df = df.xs(
-                symbol,
-                level=0,
-                axis=1,
-            )
+        try:
+
+            if symbol in df.columns.get_level_values(-1):
+
+                df = df.xs(
+                    symbol,
+                    level=-1,
+                    axis=1,
+                )
+
+            elif symbol in df.columns.get_level_values(0):
+
+                df = df.xs(
+                    symbol,
+                    level=0,
+                    axis=1,
+                )
+
+        except Exception:
+            pass
 
     required = [
         "Open",
@@ -121,31 +167,71 @@ def download_data(symbol: str) -> pd.DataFrame:
         "Volume",
     ]
 
-    if not all(
-        column in df.columns
+    missing = [
+        column
         for column in required
-    ):
+        if column not in df.columns
+    ]
+
+    if missing:
+        print(
+            f"[{symbol:<5}] missing columns: {missing}"
+        )
         return pd.DataFrame()
 
     df = df[required].copy()
 
+    # ------------------------------------------------------------------------
+    # Numeric conversion.
+    # ------------------------------------------------------------------------
+
     for column in required:
+
         df[column] = pd.to_numeric(
             df[column],
             errors="coerce",
         )
 
-    df.dropna(inplace=True)
+    df.dropna(
+        subset=required,
+        inplace=True,
+    )
 
-    # Ensure chronological order.
-    df.sort_index(inplace=True)
+    if df.empty:
+        print(f"[{symbol:<5}] all rows invalid")
+        return pd.DataFrame()
 
-    # Remove duplicate timestamps.
+    # ------------------------------------------------------------------------
+    # Timestamp cleanup.
+    # ------------------------------------------------------------------------
+
+    df.sort_index(
+        inplace=True
+    )
+
     df = df[
         ~df.index.duplicated(
             keep="last"
         )
     ]
+
+    # Remove impossible prices.
+    df = df[
+        (df["Open"] > 0)
+        & (df["High"] > 0)
+        & (df["Low"] > 0)
+        & (df["Close"] > 0)
+    ]
+
+    if df.empty:
+        print(f"[{symbol:<5}] no valid price data")
+        return pd.DataFrame()
+
+    print(
+        f"[{symbol:<5}] "
+        f"{len(df):,} bars | "
+        f"{df.index[0]} -> {df.index[-1]}"
+    )
 
     return df
 
@@ -157,26 +243,61 @@ def download_data(symbol: str) -> pd.DataFrame:
 def prepare_features(
     df: pd.DataFrame,
 ) -> pd.DataFrame:
+    """
+    Run the exact shared V13 indicator engine.
 
-    df = calculate_indicators(df)
+    No strategy logic is duplicated here.
+    """
 
     if df.empty:
         return df
 
-    # Previous values used by signal engine.
-    df["PREV_RSI_1M"] = (
-        df["RSI_1M"].shift(1)
-    )
+    try:
 
-    df["PREV_MACD_DIFF_15M"] = (
-        df["MACD_DIFF_15M"].shift(1)
-    )
+        df = calculate_indicators(
+            df.copy()
+        )
 
-    df["PREV_EMA20_4H"] = (
-        df["EMA20_4H"].shift(1)
-    )
+    except Exception as exc:
 
+        print(
+            f"feature calculation error: {exc}"
+        )
+
+        return pd.DataFrame()
+
+    if df.empty:
+        return df
+
+    # ------------------------------------------------------------------------
+    # Previous values used by the signal engine.
+    #
+    # These are shifted one bar so the signal does not accidentally
+    # use future information.
+    # ------------------------------------------------------------------------
+
+    if "RSI_1M" in df.columns:
+
+        df["PREV_RSI_1M"] = (
+            df["RSI_1M"].shift(1)
+        )
+
+    if "MACD_DIFF_15M" in df.columns:
+
+        df["PREV_MACD_DIFF_15M"] = (
+            df["MACD_DIFF_15M"].shift(1)
+        )
+
+    if "EMA20_4H" in df.columns:
+
+        df["PREV_EMA20_4H"] = (
+            df["EMA20_4H"].shift(1)
+        )
+
+    # ------------------------------------------------------------------------
     # Previous completed 5-bar high.
+    # ------------------------------------------------------------------------
+
     df["PREV_5_HIGH"] = (
         df["High"]
         .shift(1)
@@ -196,6 +317,16 @@ def calculate_position_size(
     entry_price: float,
     stop_price: float,
 ) -> int:
+    """
+    Position size based on fixed account risk.
+
+    Example:
+        Equity = $1,000
+        Risk = 0.75%
+        Risk budget = $7.50
+
+    The position is also capped at MAX_POSITION_PCT of equity.
+    """
 
     if (
         equity <= 0
@@ -205,14 +336,16 @@ def calculate_position_size(
         return 0
 
     risk_per_share = (
-        entry_price - stop_price
+        entry_price
+        - stop_price
     )
 
     if risk_per_share <= 0:
         return 0
 
     risk_dollars = (
-        equity * RISK_PER_TRADE_PCT
+        equity
+        * RISK_PER_TRADE_PCT
     )
 
     qty_by_risk = (
@@ -221,7 +354,8 @@ def calculate_position_size(
     )
 
     max_position_dollars = (
-        equity * MAX_POSITION_PCT
+        equity
+        * MAX_POSITION_PCT
     )
 
     qty_by_cap = (
@@ -241,6 +375,53 @@ def calculate_position_size(
 
 
 # ============================================================================
+# TRADE EXIT HELPER
+# ============================================================================
+
+def close_trade(
+    trades: List[Dict[str, Any]],
+    symbol: str,
+    qty: int,
+    entry_price: float,
+    exit_price: float,
+    risk_dollars: float,
+    outcome: str,
+) -> float:
+    """
+    Record a completed trade and return its P&L.
+    """
+
+    pnl = (
+        qty
+        * (
+            exit_price
+            - entry_price
+        )
+        - COMMISSION_PER_TRADE
+    )
+
+    r_multiple = (
+        pnl / risk_dollars
+        if risk_dollars > 0
+        else 0.0
+    )
+
+    trades.append(
+        {
+            "symbol": symbol,
+            "entry": entry_price,
+            "exit": exit_price,
+            "qty": qty,
+            "pnl": pnl,
+            "r": r_multiple,
+            "outcome": outcome,
+        }
+    )
+
+    return pnl
+
+
+# ============================================================================
 # BACKTEST
 # ============================================================================
 
@@ -252,6 +433,16 @@ def run_backtest(
     if df.empty:
         return empty_result(symbol)
 
+    if len(df) <= WARMUP_BARS + 1:
+
+        print(
+            f"[{symbol:<5}] "
+            f"not enough bars "
+            f"({len(df)} available)"
+        )
+
+        return empty_result(symbol)
+
     equity = STARTING_CAPITAL
 
     trades: List[Dict[str, Any]] = []
@@ -259,6 +450,7 @@ def run_backtest(
     in_trade = False
 
     qty = 0
+
     entry_price = 0.0
     stop_price = 0.0
     target_price = 0.0
@@ -271,13 +463,9 @@ def run_backtest(
         equity
     ]
 
-    # ------------------------------------------------------------------
-    # IMPORTANT:
-    #
-    # Signal at bar i is executed at bar i+1.
-    # This avoids look-ahead from using the current closing price
-    # as the fill.
-    # ------------------------------------------------------------------
+    # =========================================================================
+    # MAIN LOOP
+    # =========================================================================
 
     for i in range(
         WARMUP_BARS,
@@ -286,14 +474,19 @@ def run_backtest(
 
         row = df.iloc[i]
 
-        # ==============================================================
+        # =====================================================================
         # MANAGE OPEN POSITION
-        # ==============================================================
+        # =====================================================================
 
         if in_trade:
 
-            high = float(row["High"])
-            low = float(row["Low"])
+            high = float(
+                row["High"]
+            )
+
+            low = float(
+                row["Low"]
+            )
 
             hit_stop = (
                 low <= stop_price
@@ -303,12 +496,14 @@ def run_backtest(
                 high >= target_price
             )
 
-            # ----------------------------------------------------------
-            # Same bar touched both.
+            # -----------------------------------------------------------------
+            # BOTH STOP AND TARGET TOUCHED.
+            #
+            # We do not know which occurred first inside a 1-minute OHLC bar.
             #
             # Conservative assumption:
-            # stop gets hit first.
-            # ----------------------------------------------------------
+            # STOP FIRST.
+            # -----------------------------------------------------------------
 
             if hit_stop and hit_target:
 
@@ -316,145 +511,137 @@ def run_backtest(
 
                 exit_price = (
                     stop_price
-                    * (1 - SLIPPAGE_PCT)
-                )
-
-                pnl = (
-                    qty
                     * (
-                        exit_price
-                        - entry_price
+                        1
+                        - SLIPPAGE_PCT
                     )
-                    - COMMISSION_PER_TRADE
                 )
 
-                r_multiple = (
-                    pnl / risk_dollars
-                    if risk_dollars > 0
-                    else 0.0
-                )
-
-                trades.append(
-                    {
-                        "symbol": symbol,
-                        "entry": entry_price,
-                        "exit": exit_price,
-                        "qty": qty,
-                        "pnl": pnl,
-                        "r": r_multiple,
-                        "outcome": "LOSS",
-                    }
+                pnl = close_trade(
+                    trades=trades,
+                    symbol=symbol,
+                    qty=qty,
+                    entry_price=entry_price,
+                    exit_price=exit_price,
+                    risk_dollars=risk_dollars,
+                    outcome="LOSS",
                 )
 
                 equity += pnl
-                equity_curve.append(equity)
+
+                equity_curve.append(
+                    equity
+                )
 
                 in_trade = False
+
                 continue
 
-            # ----------------------------------------------------------
-            # Target
-            # ----------------------------------------------------------
+            # -----------------------------------------------------------------
+            # TARGET
+            # -----------------------------------------------------------------
 
             if hit_target:
 
                 exit_price = (
                     target_price
-                    * (1 - SLIPPAGE_PCT)
-                )
-
-                pnl = (
-                    qty
                     * (
-                        exit_price
-                        - entry_price
+                        1
+                        - SLIPPAGE_PCT
                     )
-                    - COMMISSION_PER_TRADE
                 )
 
-                r_multiple = (
-                    pnl / risk_dollars
-                    if risk_dollars > 0
-                    else 0.0
-                )
-
-                trades.append(
-                    {
-                        "symbol": symbol,
-                        "entry": entry_price,
-                        "exit": exit_price,
-                        "qty": qty,
-                        "pnl": pnl,
-                        "r": r_multiple,
-                        "outcome": "WIN",
-                    }
+                pnl = close_trade(
+                    trades=trades,
+                    symbol=symbol,
+                    qty=qty,
+                    entry_price=entry_price,
+                    exit_price=exit_price,
+                    risk_dollars=risk_dollars,
+                    outcome="WIN",
                 )
 
                 equity += pnl
-                equity_curve.append(equity)
+
+                equity_curve.append(
+                    equity
+                )
 
                 in_trade = False
+
                 continue
 
-            # ----------------------------------------------------------
-            # Stop
-            # ----------------------------------------------------------
+            # -----------------------------------------------------------------
+            # STOP
+            # -----------------------------------------------------------------
 
             if hit_stop:
 
                 exit_price = (
                     stop_price
-                    * (1 - SLIPPAGE_PCT)
-                )
-
-                pnl = (
-                    qty
                     * (
-                        exit_price
-                        - entry_price
+                        1
+                        - SLIPPAGE_PCT
                     )
-                    - COMMISSION_PER_TRADE
                 )
 
-                r_multiple = (
-                    pnl / risk_dollars
-                    if risk_dollars > 0
-                    else 0.0
-                )
-
-                trades.append(
-                    {
-                        "symbol": symbol,
-                        "entry": entry_price,
-                        "exit": exit_price,
-                        "qty": qty,
-                        "pnl": pnl,
-                        "r": r_multiple,
-                        "outcome": "LOSS",
-                    }
+                pnl = close_trade(
+                    trades=trades,
+                    symbol=symbol,
+                    qty=qty,
+                    entry_price=entry_price,
+                    exit_price=exit_price,
+                    risk_dollars=risk_dollars,
+                    outcome="LOSS",
                 )
 
                 equity += pnl
-                equity_curve.append(equity)
+
+                equity_curve.append(
+                    equity
+                )
 
                 in_trade = False
+
                 continue
 
-        # ==============================================================
-        # LOOK FOR NEW ENTRY
-        # ==============================================================
+        # =====================================================================
+        # NEW ENTRY
+        # =====================================================================
 
         if not in_trade:
 
-            signal = evaluate_signal(row)
+            try:
 
-            if not signal.valid:
-                equity_curve.append(equity)
+                signal = evaluate_signal(
+                    row
+                )
+
+            except Exception as exc:
+
+                print(
+                    f"[{symbol:<5}] "
+                    f"signal error at "
+                    f"{df.index[i]}: {exc}"
+                )
+
+                equity_curve.append(
+                    equity
+                )
+
                 continue
 
-            # ----------------------------------------------------------
-            # Next-bar execution.
-            # ----------------------------------------------------------
+            if not signal.valid:
+
+                equity_curve.append(
+                    equity
+                )
+
+                continue
+
+            # -----------------------------------------------------------------
+            # NEXT-BAR EXECUTION
+            # -----------------------------------------------------------------
 
             next_row = df.iloc[i + 1]
 
@@ -462,15 +649,28 @@ def run_backtest(
                 next_row["Open"]
             )
 
-            if not np.isfinite(raw_entry):
-                equity_curve.append(equity)
+            if not np.isfinite(
+                raw_entry
+            ):
+
+                equity_curve.append(
+                    equity
+                )
+
                 continue
 
-            # Slippage against buyer.
+            # Buyer receives adverse slippage.
             entry = (
                 raw_entry
-                * (1 + SLIPPAGE_PCT)
+                * (
+                    1
+                    + SLIPPAGE_PCT
+                )
             )
+
+            # -----------------------------------------------------------------
+            # ATR
+            # -----------------------------------------------------------------
 
             atr = float(
                 row["ATR_1M"]
@@ -480,16 +680,48 @@ def run_backtest(
                 not np.isfinite(atr)
                 or atr <= 0
             ):
-                equity_curve.append(equity)
+
+                equity_curve.append(
+                    equity
+                )
+
                 continue
 
-            exits = calculate_exit_prices(
-                entry,
-                atr,
+            # -----------------------------------------------------------------
+            # ATR STOP / TARGET
+            # -----------------------------------------------------------------
+
+            try:
+
+                exits = calculate_exit_prices(
+                    entry,
+                    atr,
+                )
+
+            except Exception as exc:
+
+                print(
+                    f"[{symbol:<5}] "
+                    f"exit calculation error: {exc}"
+                )
+
+                equity_curve.append(
+                    equity
+                )
+
+                continue
+
+            stop = float(
+                exits["stop"]
             )
 
-            stop = exits["stop"]
-            target = exits["target"]
+            target = float(
+                exits["target"]
+            )
+
+            # -----------------------------------------------------------------
+            # POSITION SIZE
+            # -----------------------------------------------------------------
 
             qty_candidate = (
                 calculate_position_size(
@@ -500,10 +732,17 @@ def run_backtest(
             )
 
             if qty_candidate <= 0:
-                equity_curve.append(equity)
+
+                equity_curve.append(
+                    equity
+                )
+
                 continue
 
-            # Don't exceed available starting capital.
+            # -----------------------------------------------------------------
+            # CASH LIMIT
+            # -----------------------------------------------------------------
+
             max_cash_qty = int(
                 equity / entry
             )
@@ -514,10 +753,19 @@ def run_backtest(
             )
 
             if qty_candidate <= 0:
-                equity_curve.append(equity)
+
+                equity_curve.append(
+                    equity
+                )
+
                 continue
 
+            # -----------------------------------------------------------------
+            # OPEN TRADE
+            # -----------------------------------------------------------------
+
             qty = qty_candidate
+
             entry_price = entry
             stop_price = stop
             target_price = target
@@ -530,11 +778,19 @@ def run_backtest(
                 )
             )
 
+            if risk_dollars <= 0:
+
+                equity_curve.append(
+                    equity
+                )
+
+                continue
+
             in_trade = True
 
-    # ==================================================================
-    # FORCE CLOSE REMAINING POSITION
-    # ==================================================================
+    # =========================================================================
+    # FORCE CLOSE OPEN POSITION
+    # =========================================================================
 
     if in_trade:
 
@@ -544,55 +800,46 @@ def run_backtest(
 
         exit_price = (
             final_close
-            * (1 - SLIPPAGE_PCT)
-        )
-
-        pnl = (
-            qty
             * (
-                exit_price
-                - entry_price
+                1
+                - SLIPPAGE_PCT
             )
-            - COMMISSION_PER_TRADE
         )
 
-        r_multiple = (
-            pnl / risk_dollars
-            if risk_dollars > 0
-            else 0.0
+        outcome = (
+            "WIN"
+            if exit_price > entry_price
+            else "LOSS"
         )
 
-        trades.append(
-            {
-                "symbol": symbol,
-                "entry": entry_price,
-                "exit": exit_price,
-                "qty": qty,
-                "pnl": pnl,
-                "r": r_multiple,
-                "outcome": (
-                    "WIN"
-                    if pnl > 0
-                    else "LOSS"
-                ),
-            }
+        pnl = close_trade(
+            trades=trades,
+            symbol=symbol,
+            qty=qty,
+            entry_price=entry_price,
+            exit_price=exit_price,
+            risk_dollars=risk_dollars,
+            outcome=outcome,
         )
 
         equity += pnl
 
         forced_exits += 1
-        equity_curve.append(equity)
 
-    # ==================================================================
+        equity_curve.append(
+            equity
+        )
+
+    # =========================================================================
     # STATISTICS
-    # ==================================================================
+    # =========================================================================
 
     return calculate_statistics(
-        symbol,
-        trades,
-        equity_curve,
-        ambiguous_bars,
-        forced_exits,
+        symbol=symbol,
+        trades=trades,
+        equity_curve=equity_curve,
+        ambiguous_bars=ambiguous_bars,
+        forced_exits=forced_exits,
     )
 
 
@@ -623,7 +870,9 @@ def calculate_statistics(
     ]
 
     win_rate = (
-        len(wins) / total * 100
+        len(wins)
+        / total
+        * 100
         if total
         else 0.0
     )
@@ -634,7 +883,8 @@ def calculate_statistics(
     )
 
     expectancy = (
-        net_pnl / total
+        net_pnl
+        / total
         if total
         else 0.0
     )
@@ -651,30 +901,39 @@ def calculate_statistics(
         )
     )
 
-    profit_factor = (
-        gross_profit / gross_loss
-        if gross_loss > 0
-        else (
-            float("inf")
-            if gross_profit > 0
-            else 0.0
+    if gross_loss > 0:
+
+        profit_factor = (
+            gross_profit
+            / gross_loss
         )
-    )
+
+    elif gross_profit > 0:
+
+        profit_factor = float(
+            "inf"
+        )
+
+    else:
+
+        profit_factor = 0.0
 
     avg_r = (
-        np.mean(
-            [
-                trade["r"]
-                for trade in trades
-            ]
+        float(
+            np.mean(
+                [
+                    trade["r"]
+                    for trade in trades
+                ]
+            )
         )
         if trades
         else 0.0
     )
 
-    # ------------------------------------------------------------------
-    # Maximum drawdown
-    # ------------------------------------------------------------------
+    # =========================================================================
+    # MAX DRAWDOWN
+    # =========================================================================
 
     peak = -math.inf
     max_drawdown = 0.0
@@ -720,6 +979,10 @@ def calculate_statistics(
     }
 
 
+# ============================================================================
+# EMPTY RESULT
+# ============================================================================
+
 def empty_result(
     symbol: str,
 ) -> Dict[str, Any]:
@@ -757,19 +1020,21 @@ def main() -> None:
         "  4H regime | 15M confirmation | 1M execution | ATR exits"
     )
 
+    print(
+        f"  Yahoo test window: {PERIOD}"
+    )
+
     print("=" * 78)
 
     results: List[Dict[str, Any]] = []
 
     for symbol in TICKERS:
 
-        raw = download_data(symbol)
+        raw = download_data(
+            symbol
+        )
 
         if raw.empty:
-
-            print(
-                f"[{symbol:<5}] no usable data"
-            )
 
             results.append(
                 empty_result(symbol)
@@ -777,12 +1042,15 @@ def main() -> None:
 
             continue
 
-        df = prepare_features(raw)
+        df = prepare_features(
+            raw
+        )
 
         if df.empty:
 
             print(
-                f"[{symbol:<5}] insufficient features"
+                f"[{symbol:<5}] "
+                f"insufficient features"
             )
 
             results.append(
@@ -796,7 +1064,9 @@ def main() -> None:
             df,
         )
 
-        results.append(result)
+        results.append(
+            result
+        )
 
         print(
             f"[{symbol:<5}] "
@@ -811,9 +1081,9 @@ def main() -> None:
             f"DD={result['max_drawdown']:>6.2f}%"
         )
 
-    # ==================================================================
+    # =========================================================================
     # PORTFOLIO SUMMARY
-    # ==================================================================
+    # =========================================================================
 
     total_trades = sum(
         result["trades"]
@@ -836,32 +1106,46 @@ def main() -> None:
     )
 
     total_expectancy = (
-        total_pnl / total_trades
+        total_pnl
+        / total_trades
         if total_trades
         else 0.0
     )
 
     gross_profit = sum(
-        max(result["pnl"], 0)
+        max(
+            result["pnl"],
+            0,
+        )
         for result in results
     )
 
     gross_loss = abs(
         sum(
-            min(result["pnl"], 0)
+            min(
+                result["pnl"],
+                0,
+            )
             for result in results
         )
     )
 
-    portfolio_pf = (
-        gross_profit / gross_loss
-        if gross_loss > 0
-        else (
-            float("inf")
-            if gross_profit > 0
-            else 0.0
+    if gross_loss > 0:
+
+        portfolio_pf = (
+            gross_profit
+            / gross_loss
         )
-    )
+
+    elif gross_profit > 0:
+
+        portfolio_pf = float(
+            "inf"
+        )
+
+    else:
+
+        portfolio_pf = 0.0
 
     portfolio_win_rate = (
         total_wins
@@ -884,7 +1168,8 @@ def main() -> None:
     print("-" * 78)
 
     print(
-        f"TOTAL TRADES: {total_trades}"
+        f"TOTAL TRADES: "
+        f"{total_trades}"
     )
 
     print(
@@ -907,12 +1192,18 @@ def main() -> None:
         f"${total_expectancy:.2f}"
     )
 
-    print(
-        f"PROFIT FACTOR: "
-        f"{portfolio_pf:.3f}"
-        if portfolio_pf != float("inf")
-        else "PROFIT FACTOR: inf"
-    )
+    if portfolio_pf == float("inf"):
+
+        print(
+            "PROFIT FACTOR: inf"
+        )
+
+    else:
+
+        print(
+            f"PROFIT FACTOR: "
+            f"{portfolio_pf:.3f}"
+        )
 
     print(
         f"AMBIGUOUS TP/SL BARS: "
@@ -926,38 +1217,66 @@ def main() -> None:
 
     print("=" * 78)
 
-    if total_trades < 100:
+    # =========================================================================
+    # INTERPRETATION
+    # =========================================================================
+
+    if total_trades == 0:
 
         print(
-            f"⚠️ Sample size is small "
+            "❌ NO TRADES WERE GENERATED."
+        )
+
+        print(
+            "This is NOT evidence that V13 loses."
+        )
+
+        print(
+            "Check strategy.py indicators/signals and the available "
+            "Yahoo data window."
+        )
+
+    elif total_trades < 50:
+
+        print(
+            f"⚠️ Sample size is very small "
             f"({total_trades} trades)."
         )
 
-    if total_expectancy <= 0:
+        print(
+            "Do NOT conclude that V13 beats or loses to V12 "
+            "from this sample alone."
+        )
+
+    elif total_expectancy <= 0:
 
         print(
-            "❌ V13 is NOT profitable on this test."
+            "❌ V13 is negative expectancy "
+            "on this test window."
         )
 
     elif portfolio_pf <= 1.0:
 
         print(
-            "⚠️ Positive P&L but PF <= 1.0. "
-            "Investigate before trusting it."
+            "⚠️ V13 has positive P&L but "
+            "profit factor <= 1.0."
         )
 
     else:
 
         print(
-            "✅ V13 shows positive historical expectancy."
+            "✅ V13 shows positive historical "
+            "expectancy on this test window."
         )
 
     print(
-        "IMPORTANT: This is an in-sample/historical test."
+        "IMPORTANT: Historical performance does not "
+        "guarantee future performance."
     )
 
     print(
-        "Run a separate out-of-sample period before judging V13."
+        "Use a separate out-of-sample test before "
+        "judging V13."
     )
 
     print("=" * 78)
