@@ -1,10 +1,10 @@
 import os
 import pandas as pd
 import numpy as np
-import ta
 import yfinance as yf
 from typing import List, Dict, Any
 from supabase import create_client, Client
+from strategy import calculate_indicators, check_signal  # <-- Single source of truth
 
 # =====================================================================
 # SUPABASE INITIALIZATION
@@ -33,10 +33,8 @@ RISK_PARAMS = {
     "MIN_ALLOCATION_PCT": 0.80      # Require at least 80% deployment ($800 min)
 }
 
-# [FIX] Realistic-ish cost assumptions. Zero was flattering every result.
 SLIPPAGE_PCT = 0.0005     # 5 bps in each direction (entry + exit)
-COMMISSION_PER_TRADE = 0.0  # set >0 if your broker charges per-trade fees
-
+COMMISSION_PER_TRADE = 0.0  
 
 def run_backtest(symbol: str, period: str = "60d", interval: str = "15m") -> Dict[str, Any]:
     df = yf.download(symbol, period=period, interval=interval, progress=False)
@@ -46,32 +44,9 @@ def run_backtest(symbol: str, period: str = "60d", interval: str = "15m") -> Dic
             "expectancy": 0.0, "profit_factor": 0.0, "ambiguous_bars": 0,
         }
 
-    if isinstance(df.columns, pd.MultiIndex):
-        df = df.xs(symbol, level=1, axis=1)
+    # Delegate indicator creation to the shared strategy module
+    df = calculate_indicators(df, symbol=symbol)
 
-    # 1. Technical Indicators
-    df['RSI'] = ta.momentum.rsi(df['Close'], window=14)
-
-    df['VOL_SMA20'] = df['Volume'].shift(1).rolling(20).mean()
-    df['VOL_SPIKE'] = df['Volume'] > (1.2 * df['VOL_SMA20'])
-
-    # 4H Trend Simulation (Resampled from intraday data)
-    # [FIX] origin="start" + drop the still-forming last 4H bar, matching
-    # what the live engine actually does in fetch_4h_bars_cached(). Without
-    # this, the backtest's 4H trend at any given moment could reflect an
-    # incomplete bar the live engine would never have used yet — a subtle
-    # backtest/live mismatch, not outright lookahead, but still worth fixing
-    # so the backtest is honest about what the live bot would have seen.
-    df_4h = df.resample("4h", origin="start").agg({'Close': 'last'}).dropna()
-    if len(df_4h) > 1:
-        df_4h = df_4h.iloc[:-1]
-    df_4h['EMA20'] = ta.trend.ema_indicator(df_4h['Close'], window=20)
-    df_4h['EMA50'] = ta.trend.ema_indicator(df_4h['Close'], window=50)
-    df_4h['TREND_4H'] = np.where(df_4h['EMA20'] > df_4h['EMA50'], "BULLISH", "BEARISH")
-
-    df['TREND_4H'] = df_4h['TREND_4H'].reindex(df.index, method='ffill')
-
-    # 2. Execution Simulation Loop
     trades = []
     ambiguous_bars = 0
     in_trade = False
@@ -83,15 +58,14 @@ def run_backtest(symbol: str, period: str = "60d", interval: str = "15m") -> Dic
         price = float(row['Close'])
 
         if not in_trade:
-            if row['RSI'] < 30 and row['VOL_SPIKE'] and row['TREND_4H'] == "BULLISH":
+            # Delegate signal evaluation to the shared strategy module
+            if check_signal(row):
                 qty = int(DEFAULT_DOLLAR_ALLOCATION // price)
                 allocated_dollars = qty * price
                 min_required_dollars = DEFAULT_DOLLAR_ALLOCATION * RISK_PARAMS["MIN_ALLOCATION_PCT"]
 
                 if qty >= 1 and allocated_dollars >= min_required_dollars:
                     in_trade = True
-                    # [FIX] apply entry slippage — you very rarely get filled
-                    # at the exact signal-bar close in live trading
                     entry_price = price * (1 + SLIPPAGE_PCT)
                     allocated_cash = allocated_dollars
                     tp_price = entry_price * (1 + RISK_PARAMS["TAKE_PROFIT_PCT"])
@@ -104,11 +78,6 @@ def run_backtest(symbol: str, period: str = "60d", interval: str = "15m") -> Dic
             hit_sl = low <= sl_price
 
             if hit_tp and hit_sl:
-                # [FIX] This was the main bug: previously always resolved as
-                # a WIN whenever both levels were touched in the same bar,
-                # which is impossible to determine from OHLC alone and
-                # systematically inflated the win rate. Standard conservative
-                # convention: assume the stop-loss was hit first.
                 ambiguous_bars += 1
                 exit_price = sl_price * (1 - SLIPPAGE_PCT)
                 pnl = allocated_cash * ((exit_price - entry_price) / entry_price) - COMMISSION_PER_TRADE
@@ -125,26 +94,17 @@ def run_backtest(symbol: str, period: str = "60d", interval: str = "15m") -> Dic
                 trades.append({'outcome': 'LOSS', 'pnl': pnl, 'return_pct': (exit_price - entry_price) / entry_price})
                 in_trade = False
 
-    # 3. Aggregated Performance Metrics
     total_trades = len(trades)
     wins = [t for t in trades if t['outcome'] == 'WIN']
     losses = [t for t in trades if t['outcome'] == 'LOSS']
 
     win_rate = (len(wins) / total_trades * 100) if total_trades > 0 else 0.0
     total_pnl = sum(t['pnl'] for t in trades)
-
-    # [FIX] Added: win rate alone is a misleading optimization target when
-    # win/loss sizes are asymmetric. Expectancy (avg $ per trade) and profit
-    # factor (gross win $ / gross loss $) tell you whether the strategy is
-    # actually worth trading.
     expectancy = (total_pnl / total_trades) if total_trades > 0 else 0.0
     gross_win = sum(t['pnl'] for t in wins)
     gross_loss = abs(sum(t['pnl'] for t in losses))
     profit_factor = (gross_win / gross_loss) if gross_loss > 0 else (float('inf') if gross_win > 0 else 0.0)
 
-    # [FIX] float('inf') isn't valid JSON — it was silently breaking the
-    # Supabase insert at the very end of the run. Store it as None for
-    # JSON/DB purposes; the console print still shows "inf" separately.
     profit_factor_display = "inf" if profit_factor == float('inf') else round(profit_factor, 2)
     profit_factor_json = None if profit_factor == float('inf') else round(profit_factor, 2)
 
@@ -163,7 +123,7 @@ def run_backtest(symbol: str, period: str = "60d", interval: str = "15m") -> Dic
 if __name__ == "__main__":
     print("=========================================================")
     print("  STRATEGY BACKTEST: RSI < 30 + VOL SPIKE + 4H BULL TREND")
-    print("  (same-bar TP/SL ambiguity now resolved conservatively)")
+    print("  (v13 Unified Engine Architecture)")
     print("=========================================================")
 
     summary = []
@@ -191,14 +151,9 @@ if __name__ == "__main__":
     if total_ambiguous:
         print(f"⚠️  {total_ambiguous} trade(s) had both TP and SL touched in the same bar — resolved as losses (conservative).")
     if total_all_trades < 100:
-        print(f"⚠️  Sample size is small ({total_all_trades} trades). Treat these win-rate numbers as directional, not reliable, until you have a much larger sample (e.g. longer history at 1h/4h resolution).")
+        print(f"⚠️  Sample size is small ({total_all_trades} trades). Treat these win-rate numbers as directional, not reliable.")
     print("=========================================================")
 
-    # [FIX] Actual backtest_runs schema is per-ticker rows:
-    # (id, created_at, ticker, trades, win_rate, net_pnl) — NOT a single
-    # aggregate row with strategy_name/avg_win_rate/ticker_summary. That
-    # mismatch is why every previous push failed. Insert one row per
-    # ticker instead, matching the real columns exactly.
     if supabase:
         try:
             rows = [
