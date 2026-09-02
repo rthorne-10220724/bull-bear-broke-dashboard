@@ -1,50 +1,28 @@
 """
-BULL. BEAR AND BROKE - STRATEGY v12
+BULL. BEAR AND BROKE - STRATEGY v13
 ====================================
 
-Single source of truth for:
-    - indicators
-    - signal scoring
-    - data-quality gates
-    - ATR risk
-    - position sizing
-    - entry/exit calculations
+Regime-adaptive pullback/reclaim strategy.
 
-Used by BOTH:
-    1. live/paper trading engine
-    2. historical backtester
+Architecture:
+    1. Data quality
+    2. 4H regime gate
+    3. 15M momentum/setup confirmation
+    4. 1M execution trigger
+    5. Setup score
+    6. ATR-based risk levels
 
 IMPORTANT:
-------------
-This is a research/trading framework, not a guarantee of profitability.
+    This is an experimental strategy.
+    It is NOT guaranteed profitable.
 
-Core philosophy:
-    HARD GATES
-        - sufficient data
-        - sufficient volatility/liquidity
-        - 4H bullish trend
-        - positive 4H trend slope
-        - no excessive extension
-
-    SETUP SCORE
-        - RSI
-        - MACD
-        - 1m EMA structure
-        - healthy pullback
-        - breakout
-        - volume
-
-    RISK
-        - ATR stop
-        - ATR target
-        - fixed percentage account risk
-        - position cap
+The backtester should be the judge.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -52,16 +30,16 @@ import ta
 
 
 # ============================================================================
-# CONFIGURATION
+# CONFIG
 # ============================================================================
-
-RISK_PER_TRADE_PCT = 0.0075       # 0.75% account risk
-MAX_POSITION_PCT = 0.15           # 15% max notional allocation
 
 RSI_WINDOW = 14
 
 EMA_FAST_1M = 9
 EMA_SLOW_1M = 21
+
+EMA_FAST_15M = 9
+EMA_SLOW_15M = 21
 
 EMA_FAST_4H = 20
 EMA_SLOW_4H = 50
@@ -72,77 +50,134 @@ MACD_SIGNAL = 9
 
 ATR_WINDOW = 14
 
-MIN_SIGNAL_SCORE = 6
+MIN_RVOL = 0.75
 
-MAX_ALLOWED_EXTENSION_ATR = 1.25
-MIN_RVOL = 0.70
+# Signal quality
+MIN_SIGNAL_SCORE = 7
 
-ATR_MULTIPLIER_STOP = 1.50
-ATR_MULTIPLIER_TARGET = 3.75
+# Do not chase extremely extended price.
+MAX_EXTENSION_ATR = 1.75
 
-ENTRY_LIMIT_BUFFER_PCT = 0.0005
+# Pullback must remain structurally healthy.
+MAX_PULLBACK_ATR = 1.25
+
+# Minimum reward/risk before entering.
+MIN_REWARD_RISK = 1.80
+
+# ATR exits
+STOP_ATR = 1.50
+TARGET_ATR = 3.00
 
 
 # ============================================================================
-# DATA NORMALIZATION
+# HELPERS
 # ============================================================================
 
-def normalize_ohlcv(df: pd.DataFrame) -> Optional[pd.DataFrame]:
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        value = float(value)
+        return value if np.isfinite(value) else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _rvol(volume: pd.Series, window: int = 20) -> float:
     """
-    Normalize OHLCV column names and numeric types.
+    Relative volume using ONLY completed prior bars as baseline.
+    """
+    if len(volume) < window + 1:
+        return 0.0
+
+    baseline = volume.iloc[-window - 1:-1].mean()
+
+    if baseline <= 0 or not np.isfinite(baseline):
+        return 0.0
+
+    return _safe_float(volume.iloc[-1] / baseline)
+
+
+def _atr(df: pd.DataFrame, window: int = ATR_WINDOW) -> float:
+    """
+    Wilder-style ATR through the ta library.
+    """
+    if len(df) < window + 2:
+        return 0.0
+
+    atr = ta.volatility.average_true_range(
+        high=df["High"],
+        low=df["Low"],
+        close=df["Close"],
+        window=window,
+    )
+
+    return _safe_float(atr.iloc[-1])
+
+
+def _resample_ohlcv(
+    df: pd.DataFrame,
+    rule: str,
+) -> pd.DataFrame:
+
+    result = (
+        df.resample(rule)
+        .agg(
+            {
+                "Open": "first",
+                "High": "max",
+                "Low": "min",
+                "Close": "last",
+                "Volume": "sum",
+            }
+        )
+        .dropna()
+    )
+
+    return result
+
+
+# ============================================================================
+# INDICATORS
+# ============================================================================
+
+def calculate_indicators(
+    df: pd.DataFrame,
+    symbol: str = "",
+) -> pd.DataFrame:
+    """
+    Shared indicator calculation.
+
+    Expected input:
+        Open High Low Close Volume
+
+    Input timeframe:
+        1-minute bars.
+
+    Higher timeframes are derived internally.
     """
 
     if df is None or df.empty:
-        return None
+        return pd.DataFrame()
 
     df = df.copy()
 
-    # Handle common yfinance MultiIndex layout.
-    if isinstance(df.columns, pd.MultiIndex):
-        # Flatten where possible.
-        if len(df.columns.levels) >= 2:
-            flattened = []
+    # Handle yfinance MultiIndex.
+    if isinstance(df.columns, pd.MultiIndex) and symbol:
 
-            for col in df.columns:
-                if isinstance(col, tuple):
-                    # Prefer the actual OHLCV field.
-                    selected = None
-
-                    for value in col:
-                        if str(value).lower() in {
-                            "open",
-                            "high",
-                            "low",
-                            "close",
-                            "volume",
-                        }:
-                            selected = value
-                            break
-
-                    flattened.append(
-                        selected if selected is not None else str(col[-1])
-                    )
-                else:
-                    flattened.append(str(col))
-
-            df.columns = flattened
-
-    rename_map = {
-        "open": "Open",
-        "high": "High",
-        "low": "Low",
-        "close": "Close",
-        "volume": "Volume",
-        "adj close": "Adj Close",
-    }
-
-    df.rename(
-        columns={
-            col: rename_map.get(str(col).lower(), col)
-            for col in df.columns
-        },
-        inplace=True,
-    )
+        try:
+            if symbol in df.columns.get_level_values(-1):
+                df = df.xs(
+                    symbol,
+                    level=-1,
+                    axis=1,
+                )
+            elif symbol in df.columns.get_level_values(0):
+                df = df.xs(
+                    symbol,
+                    level=0,
+                    axis=1,
+                )
+        except Exception:
+            pass
 
     required = [
         "Open",
@@ -153,7 +188,7 @@ def normalize_ohlcv(df: pd.DataFrame) -> Optional[pd.DataFrame]:
     ]
 
     if not all(column in df.columns for column in required):
-        return None
+        return pd.DataFrame()
 
     df = df[required].copy()
 
@@ -163,393 +198,189 @@ def normalize_ohlcv(df: pd.DataFrame) -> Optional[pd.DataFrame]:
             errors="coerce",
         )
 
-    df.replace([np.inf, -np.inf], np.nan, inplace=True)
-    df.dropna(inplace=True)
+    df = df.dropna()
 
-    if len(df) < 30:
-        return None
-
-    # Ensure chronological order.
-    df = df.sort_index()
-
-    return df
-
-
-# ============================================================================
-# ATR
-# ============================================================================
-
-def calculate_atr(
-    df: pd.DataFrame,
-    window: int = ATR_WINDOW,
-) -> float:
-
-    if df is None or len(df) < window + 1:
-        return 0.0
-
-    high = df["High"]
-    low = df["Low"]
-    close = df["Close"]
-
-    previous_close = close.shift(1)
-
-    true_range = pd.concat(
-        [
-            high - low,
-            (high - previous_close).abs(),
-            (low - previous_close).abs(),
-        ],
-        axis=1,
-    ).max(axis=1)
-
-    atr = true_range.rolling(window).mean().iloc[-1]
-
-    if pd.isna(atr):
-        return 0.0
-
-    return float(atr)
-
-
-# ============================================================================
-# RVOL
-# ============================================================================
-
-def calculate_rvol(
-    volume: pd.Series,
-    window: int = 20,
-) -> float:
-
-    if len(volume) < window + 1:
-        return 0.0
-
-    # Exclude current bar from baseline.
-    baseline = volume.iloc[-window - 1:-1].mean()
-
-    if baseline <= 0 or pd.isna(baseline):
-        return 0.0
-
-    return float(volume.iloc[-1] / baseline)
-
-
-# ============================================================================
-# 4H TREND
-# ============================================================================
-
-def calculate_4h_indicators(
-    df_4h: pd.DataFrame,
-) -> Dict[str, Any]:
-
-    if df_4h is None or len(df_4h) < EMA_SLOW_4H + 4:
-        return {
-            "trend_4h": "UNKNOWN",
-            "ema20_4h": 0.0,
-            "ema50_4h": 0.0,
-            "ema20_slope_positive": False,
-        }
-
-    close_4h = df_4h["Close"]
-
-    ema20 = ta.trend.ema_indicator(
-        close_4h,
-        window=EMA_FAST_4H,
-    )
-
-    ema50 = ta.trend.ema_indicator(
-        close_4h,
-        window=EMA_SLOW_4H,
-    )
-
-    ema20_value = float(ema20.iloc[-1])
-    ema50_value = float(ema50.iloc[-1])
-
-    if pd.isna(ema20_value) or pd.isna(ema50_value):
-        return {
-            "trend_4h": "UNKNOWN",
-            "ema20_4h": 0.0,
-            "ema50_4h": 0.0,
-            "ema20_slope_positive": False,
-        }
-
-    trend = (
-        "BULLISH"
-        if ema20_value > ema50_value
-        else "BEARISH"
-    )
-
-    slope_positive = bool(
-        ema20.iloc[-1] > ema20.iloc[-4]
-    )
-
-    return {
-        "trend_4h": trend,
-        "ema20_4h": ema20_value,
-        "ema50_4h": ema50_value,
-        "ema20_slope_positive": slope_positive,
-    }
-
-
-# ============================================================================
-# INDICATOR ANALYSIS
-# ============================================================================
-
-def analyze_indicators(
-    df_1m: pd.DataFrame,
-    df_4h: pd.DataFrame,
-) -> Dict[str, Any]:
-
-    df_1m = normalize_ohlcv(df_1m)
-    df_4h = normalize_ohlcv(df_4h)
-
-    if df_1m is None:
-        raise ValueError("Invalid 1m OHLCV data")
-
-    if df_4h is None:
-        raise ValueError("Invalid 4H OHLCV data")
-
-    close = df_1m["Close"]
-    high = df_1m["High"]
-    low = df_1m["Low"]
-    volume = df_1m["Volume"]
-
-    price = float(close.iloc[-1])
+    if len(df) < 100:
+        return pd.DataFrame()
 
     # ------------------------------------------------------------------
-    # RSI
+    # 1M indicators
     # ------------------------------------------------------------------
 
-    rsi_series = ta.momentum.rsi(
-        close,
+    df["RSI_1M"] = ta.momentum.rsi(
+        df["Close"],
         window=RSI_WINDOW,
     )
 
-    rsi = float(rsi_series.iloc[-1])
-    previous_rsi = float(rsi_series.iloc[-2])
-
-    rsi_recovering = (
-        rsi > previous_rsi
-        and rsi >= 45
-    )
-
-    rsi_bullish = rsi >= 50
-
-    # ------------------------------------------------------------------
-    # 1m EMA
-    # ------------------------------------------------------------------
-
-    ema9 = ta.trend.ema_indicator(
-        close,
+    df["EMA9_1M"] = ta.trend.ema_indicator(
+        df["Close"],
         window=EMA_FAST_1M,
     )
 
-    ema21 = ta.trend.ema_indicator(
-        close,
+    df["EMA21_1M"] = ta.trend.ema_indicator(
+        df["Close"],
         window=EMA_SLOW_1M,
     )
 
-    ema9_now = float(ema9.iloc[-1])
-    ema21_now = float(ema21.iloc[-1])
+    df["ATR_1M"] = ta.volatility.average_true_range(
+        df["High"],
+        df["Low"],
+        df["Close"],
+        window=ATR_WINDOW,
+    )
 
-    short_term_bullish = (
-        price > ema9_now
-        and ema9_now >= ema21_now
+    # RVOL against prior completed bars.
+    df["RVOL"] = (
+        df["Volume"]
+        / df["Volume"]
+        .shift(1)
+        .rolling(20)
+        .mean()
     )
 
     # ------------------------------------------------------------------
-    # MACD
-    #
-    # Calculate from completed 15m closes.
+    # 15M indicators
     # ------------------------------------------------------------------
 
-    close_15m = (
-        close
-        .resample("15min")
-        .last()
-        .dropna()
-    )
+    df15 = _resample_ohlcv(df, "15min")
 
-    macd_diff = 0.0
-    macd_previous = 0.0
-    macd_available = False
+    if len(df15) >= 60:
 
-    if len(close_15m) >= 40:
+        df15["EMA9"] = ta.trend.ema_indicator(
+            df15["Close"],
+            window=EMA_FAST_15M,
+        )
 
-        macd = ta.trend.macd_diff(
-            close_15m,
-            window_slow=MACD_SLOW,
+        df15["EMA21"] = ta.trend.ema_indicator(
+            df15["Close"],
+            window=EMA_SLOW_15M,
+        )
+
+        df15["RSI"] = ta.momentum.rsi(
+            df15["Close"],
+            window=RSI_WINDOW,
+        )
+
+        macd = ta.trend.MACD(
+            close=df15["Close"],
             window_fast=MACD_FAST,
+            window_slow=MACD_SLOW,
             window_sign=MACD_SIGNAL,
         )
 
-        clean_macd = macd.dropna()
+        df15["MACD"] = macd.macd()
+        df15["MACD_SIGNAL"] = macd.macd_signal()
+        df15["MACD_DIFF"] = macd.macd_diff()
 
-        if len(clean_macd) >= 2:
+        # Align ONLY completed 15M candles.
+        df15 = df15.shift(1)
 
-            macd_diff = float(clean_macd.iloc[-1])
-            macd_previous = float(clean_macd.iloc[-2])
-
-            macd_available = True
-
-    macd_improving = (
-        macd_available
-        and macd_diff >= macd_previous
-    )
-
-    macd_positive = (
-        macd_available
-        and macd_diff > 0
-    )
-
-    # ------------------------------------------------------------------
-    # RVOL
-    # ------------------------------------------------------------------
-
-    rvol = calculate_rvol(volume)
-
-    volume_spike = rvol >= 1.20
-
-    # ------------------------------------------------------------------
-    # ATR
-    # ------------------------------------------------------------------
-
-    atr = calculate_atr(df_1m)
-
-    atr_pct = (
-        atr / price * 100
-        if price > 0
-        else 0.0
-    )
-
-    # ------------------------------------------------------------------
-    # Micro-breakout
-    # ------------------------------------------------------------------
-
-    if len(high) >= 6:
-        previous_high = float(
-            high.iloc[-6:-1].max()
-        )
-        breakout = price >= previous_high
-    else:
-        breakout = False
-
-    # ------------------------------------------------------------------
-    # Pullback quality
-    # ------------------------------------------------------------------
-
-    if atr > 0:
-
-        distance_from_ema21_atr = (
-            abs(price - ema21_now) / atr
+        df["EMA9_15M"] = df15["EMA9"].reindex(
+            df.index,
+            method="ffill",
         )
 
-        extension_atr = (
-            (price - ema21_now) / atr
+        df["EMA21_15M"] = df15["EMA21"].reindex(
+            df.index,
+            method="ffill",
+        )
+
+        df["RSI_15M"] = df15["RSI"].reindex(
+            df.index,
+            method="ffill",
+        )
+
+        df["MACD_15M"] = df15["MACD"].reindex(
+            df.index,
+            method="ffill",
+        )
+
+        df["MACD_SIGNAL_15M"] = df15[
+            "MACD_SIGNAL"
+        ].reindex(
+            df.index,
+            method="ffill",
+        )
+
+        df["MACD_DIFF_15M"] = df15[
+            "MACD_DIFF"
+        ].reindex(
+            df.index,
+            method="ffill",
         )
 
     else:
 
-        distance_from_ema21_atr = 999.0
-        extension_atr = 999.0
-
-    healthy_pullback = (
-        price >= ema21_now - (0.75 * atr)
-        and distance_from_ema21_atr <= 1.50
-    )
-
-    not_overextended = (
-        extension_atr <= MAX_ALLOWED_EXTENSION_ATR
-    )
+        for column in [
+            "EMA9_15M",
+            "EMA21_15M",
+            "RSI_15M",
+            "MACD_15M",
+            "MACD_SIGNAL_15M",
+            "MACD_DIFF_15M",
+        ]:
+            df[column] = np.nan
 
     # ------------------------------------------------------------------
-    # 4H trend
+    # 4H indicators
     # ------------------------------------------------------------------
 
-    trend_data = calculate_4h_indicators(
-        df_4h
-    )
+    df4 = _resample_ohlcv(df, "4h")
 
-    return {
-        "price": price,
+    if len(df4) >= EMA_SLOW_4H + 5:
 
-        "rsi": rsi,
-        "previous_rsi": previous_rsi,
-        "rsi_recovering": rsi_recovering,
-        "rsi_bullish": rsi_bullish,
+        df4["EMA20"] = ta.trend.ema_indicator(
+            df4["Close"],
+            window=EMA_FAST_4H,
+        )
 
-        "ema9": ema9_now,
-        "ema21": ema21_now,
-        "short_term_bullish": short_term_bullish,
+        df4["EMA50"] = ta.trend.ema_indicator(
+            df4["Close"],
+            window=EMA_SLOW_4H,
+        )
 
-        "macd_available": macd_available,
-        "macd_diff": macd_diff,
-        "macd_previous": macd_previous,
-        "macd_improving": macd_improving,
-        "macd_positive": macd_positive,
+        df4["ATR"] = ta.volatility.average_true_range(
+            df4["High"],
+            df4["Low"],
+            df4["Close"],
+            window=ATR_WINDOW,
+        )
 
-        "rvol": rvol,
-        "volume_spike": volume_spike,
+        # IMPORTANT:
+        # Remove the currently forming 4H candle.
+        df4 = df4.shift(1)
 
-        "atr": atr,
-        "atr_pct": atr_pct,
+        df["EMA20_4H"] = df4["EMA20"].reindex(
+            df.index,
+            method="ffill",
+        )
 
-        "breakout": breakout,
-        "healthy_pullback": healthy_pullback,
+        df["EMA50_4H"] = df4["EMA50"].reindex(
+            df.index,
+            method="ffill",
+        )
 
-        "distance_from_ema21_atr": distance_from_ema21_atr,
-        "extension_atr": extension_atr,
-        "not_overextended": not_overextended,
+        df["ATR_4H"] = df4["ATR"].reindex(
+            df.index,
+            method="ffill",
+        )
 
-        **trend_data,
-    }
+        df["CLOSE_4H"] = df4["Close"].reindex(
+            df.index,
+            method="ffill",
+        )
 
+    else:
 
-# ============================================================================
-# DATA QUALITY
-# ============================================================================
+        for column in [
+            "EMA20_4H",
+            "EMA50_4H",
+            "ATR_4H",
+            "CLOSE_4H",
+        ]:
+            df[column] = np.nan
 
-def passes_data_quality(
-    df_1m: pd.DataFrame,
-    indicators: Dict[str, Any],
-) -> Tuple[bool, str]:
-
-    if df_1m is None or len(df_1m) < 60:
-        return False, "insufficient 1m history"
-
-    required_columns = {
-        "Open",
-        "High",
-        "Low",
-        "Close",
-        "Volume",
-    }
-
-    if not required_columns.issubset(df_1m.columns):
-        return False, "missing OHLCV columns"
-
-    recent = df_1m[
-        list(required_columns)
-    ].tail(60)
-
-    if not np.isfinite(
-        recent.to_numpy(dtype=float)
-    ).all():
-        return False, "non-finite market data"
-
-    if indicators["price"] <= 0:
-        return False, "invalid price"
-
-    if indicators["atr"] <= 0:
-        return False, "invalid ATR"
-
-    if indicators["rvol"] < MIN_RVOL:
-        return False, "insufficient RVOL"
-
-    if indicators["atr_pct"] < 0.35:
-        return False, "volatility too low"
-
-    if indicators["trend_4h"] == "UNKNOWN":
-        return False, "4H trend unavailable"
-
-    return True, "data/volatility valid"
+    return df
 
 
 # ============================================================================
@@ -564,379 +395,281 @@ class SignalResult:
     rejection: Optional[str] = None
 
 
+def check_signal(
+    row: pd.Series,
+) -> bool:
+    """
+    Compatibility function.
+
+    Returns only whether V13 has a valid entry.
+    """
+
+    return evaluate_signal(row).valid
+
+
 def evaluate_signal(
-    indicators: Dict[str, Any],
+    row: pd.Series,
 ) -> SignalResult:
 
     reasons: List[str] = []
     score = 0
 
-    # ------------------------------------------------------------------
-    # HARD TREND GATE
-    # ------------------------------------------------------------------
+    price = _safe_float(row.get("Close"))
+    atr = _safe_float(row.get("ATR_1M"))
 
-    if indicators["trend_4h"] != "BULLISH":
-
+    if price <= 0:
         return SignalResult(
-            valid=False,
-            score=0,
-            reasons=[],
-            rejection=(
-                f"4H trend is "
-                f"{indicators['trend_4h']}"
-            ),
+            False,
+            0,
+            [],
+            "invalid price",
         )
 
-    reasons.append("4H trend bullish")
-
-    if not indicators["ema20_slope_positive"]:
-
+    if atr <= 0:
         return SignalResult(
-            valid=False,
-            score=0,
-            reasons=reasons,
-            rejection="4H EMA20 slope not positive",
-        )
-
-    reasons.append("4H trend slope positive")
-
-    # ------------------------------------------------------------------
-    # EXTENSION GATE
-    # ------------------------------------------------------------------
-
-    if not indicators["not_overextended"]:
-
-        return SignalResult(
-            valid=False,
-            score=0,
-            reasons=reasons,
-            rejection=(
-                f"price extended "
-                f"{indicators['extension_atr']:.2f} ATR "
-                f"above EMA21"
-            ),
+            False,
+            0,
+            [],
+            "invalid ATR",
         )
 
     # ------------------------------------------------------------------
-    # RSI
+    # HARD GATE 1 — 4H trend
     # ------------------------------------------------------------------
 
-    if indicators["rsi_bullish"]:
+    ema20_4h = _safe_float(row.get("EMA20_4H"))
+    ema50_4h = _safe_float(row.get("EMA50_4H"))
 
+    if ema20_4h <= ema50_4h:
+        return SignalResult(
+            False,
+            0,
+            [],
+            "4H trend bearish",
+        )
+
+    reasons.append("4H bullish")
+
+    # ------------------------------------------------------------------
+    # HARD GATE 2 — 4H slope
+    # ------------------------------------------------------------------
+    #
+    # Slope confirmation is represented by the current EMA relationship
+    # and the previous completed 4H trend state when available.
+    #
+    # The backtester can additionally validate regime persistence.
+    # ------------------------------------------------------------------
+
+    previous_ema20 = _safe_float(
+        row.get("PREV_EMA20_4H")
+    )
+
+    if previous_ema20 > 0 and ema20_4h <= previous_ema20:
+        return SignalResult(
+            False,
+            0,
+            reasons,
+            "4H EMA20 slope not positive",
+        )
+
+    reasons.append("4H slope positive")
+
+    # ------------------------------------------------------------------
+    # HARD GATE 3 — avoid excessive extension
+    # ------------------------------------------------------------------
+
+    extension_atr = (
+        (price - ema20_4h) / atr
+        if atr > 0
+        else 999
+    )
+
+    if extension_atr > MAX_EXTENSION_ATR:
+        return SignalResult(
+            False,
+            0,
+            reasons,
+            f"extended {extension_atr:.2f} ATR",
+        )
+
+    # ------------------------------------------------------------------
+    # 1M momentum
+    # ------------------------------------------------------------------
+
+    rsi = _safe_float(row.get("RSI_1M"))
+    previous_rsi = _safe_float(
+        row.get("PREV_RSI_1M")
+    )
+
+    if rsi >= 50:
         score += 2
-        reasons.append("RSI >= 50")
+        reasons.append("1M RSI bullish")
 
-    elif indicators["rsi_recovering"]:
-
+    elif rsi > previous_rsi and rsi >= 40:
         score += 1
-        reasons.append("RSI recovering")
+        reasons.append("1M RSI recovering")
 
     # ------------------------------------------------------------------
-    # MACD
+    # 15M trend
     # ------------------------------------------------------------------
 
-    if indicators["macd_positive"]:
+    ema9_15 = _safe_float(row.get("EMA9_15M"))
+    ema21_15 = _safe_float(row.get("EMA21_15M"))
 
-        score += 1
-        reasons.append("MACD positive")
-
-    if indicators["macd_improving"]:
-
-        score += 1
-        reasons.append("MACD improving")
-
-    # ------------------------------------------------------------------
-    # SHORT TERM STRUCTURE
-    # ------------------------------------------------------------------
-
-    if indicators["short_term_bullish"]:
-
+    if (
+        ema9_15 > 0
+        and ema21_15 > 0
+        and ema9_15 > ema21_15
+    ):
         score += 2
-        reasons.append("1m EMA structure bullish")
+        reasons.append("15M EMA bullish")
 
     # ------------------------------------------------------------------
-    # PULLBACK
+    # 15M MACD
     # ------------------------------------------------------------------
 
-    if indicators["healthy_pullback"]:
+    macd = _safe_float(row.get("MACD_DIFF_15M"))
+    previous_macd = _safe_float(
+        row.get("PREV_MACD_DIFF_15M")
+    )
 
+    if macd > 0:
+        score += 1
+        reasons.append("15M MACD positive")
+
+    if macd > previous_macd:
+        score += 1
+        reasons.append("15M MACD improving")
+
+    # ------------------------------------------------------------------
+    # 1M EMA structure
+    # ------------------------------------------------------------------
+
+    ema9 = _safe_float(row.get("EMA9_1M"))
+    ema21 = _safe_float(row.get("EMA21_1M"))
+
+    if (
+        price > ema9
+        and ema9 > ema21
+    ):
         score += 2
+        reasons.append("1M reclaim")
+
+    # ------------------------------------------------------------------
+    # Pullback quality
+    # ------------------------------------------------------------------
+
+    pullback_distance = (
+        abs(price - ema21) / atr
+        if atr > 0
+        else 999
+    )
+
+    healthy_pullback = (
+        price >= ema21 - MAX_PULLBACK_ATR * atr
+        and pullback_distance <= 1.75
+    )
+
+    if healthy_pullback:
+        score += 1
         reasons.append("healthy pullback")
 
     # ------------------------------------------------------------------
-    # BREAKOUT
+    # Volume
     # ------------------------------------------------------------------
 
-    if indicators["breakout"]:
+    rvol = _safe_float(row.get("RVOL"))
 
-        score += 1
-        reasons.append("micro-breakout")
-
-    # ------------------------------------------------------------------
-    # VOLUME
-    # ------------------------------------------------------------------
-
-    if indicators["volume_spike"]:
-
-        score += 1
+    if rvol >= 1.20:
+        score += 2
         reasons.append("volume expansion")
 
+    elif rvol >= MIN_RVOL:
+        score += 1
+        reasons.append("adequate volume")
+
     # ------------------------------------------------------------------
-    # FINAL QUALITY GATE
+    # Reclaim / breakout
+    # ------------------------------------------------------------------
+
+    previous_high = _safe_float(
+        row.get("PREV_5_HIGH")
+    )
+
+    if previous_high > 0 and price >= previous_high:
+        score += 1
+        reasons.append("micro breakout")
+
+    # ------------------------------------------------------------------
+    # Minimum score
     # ------------------------------------------------------------------
 
     if score < MIN_SIGNAL_SCORE:
-
         return SignalResult(
-            valid=False,
-            score=score,
-            reasons=reasons,
-            rejection=(
-                f"signal score {score}/"
-                f"{MIN_SIGNAL_SCORE}"
-            ),
+            False,
+            score,
+            reasons,
+            f"score {score}/{MIN_SIGNAL_SCORE}",
         )
 
-    return SignalResult(
-        valid=True,
-        score=score,
-        reasons=reasons,
-        rejection=None,
-    )
+    # ------------------------------------------------------------------
+    # Reward/risk sanity check
+    # ------------------------------------------------------------------
 
-
-# ============================================================================
-# POSITION SIZE
-# ============================================================================
-
-def calculate_position_size(
-    equity: float,
-    buying_power: float,
-    price: float,
-    atr: float,
-) -> int:
-    """
-    Position sizing based on:
-        1. fixed account risk
-        2. maximum portfolio allocation
-        3. buying power
-
-    Stock orders are whole shares.
-    """
-
-    if (
-        equity <= 0
-        or buying_power <= 0
-        or price <= 0
-        or atr <= 0
-    ):
-        return 0
-
-    risk_dollars = (
-        equity * RISK_PER_TRADE_PCT
-    )
-
-    stop_distance = (
-        ATR_MULTIPLIER_STOP * atr
-    )
+    stop_distance = STOP_ATR * atr
+    target_distance = TARGET_ATR * atr
 
     if stop_distance <= 0:
-        return 0
+        return SignalResult(
+            False,
+            score,
+            reasons,
+            "invalid stop distance",
+        )
 
-    qty_by_risk = (
-        risk_dollars / stop_distance
+    reward_risk = (
+        target_distance / stop_distance
     )
 
-    qty_by_cap = (
-        equity * MAX_POSITION_PCT
-    ) / price
+    if reward_risk < MIN_REWARD_RISK:
+        return SignalResult(
+            False,
+            score,
+            reasons,
+            f"R:R {reward_risk:.2f} below minimum",
+        )
 
-    qty_by_buying_power = (
-        buying_power * 0.95
-    ) / price
-
-    qty = min(
-        qty_by_risk,
-        qty_by_cap,
-        qty_by_buying_power,
+    reasons.append(
+        f"R:R {reward_risk:.2f}"
     )
 
-    return max(0, int(qty))
+    return SignalResult(
+        True,
+        score,
+        reasons,
+    )
 
 
 # ============================================================================
-# ENTRY / EXIT PRICES
+# BACKTEST EXIT HELPERS
 # ============================================================================
-
-def calculate_entry_price(
-    latest_price: float,
-) -> float:
-
-    if latest_price <= 0:
-        return 0.0
-
-    raw = latest_price * (
-        1 + ENTRY_LIMIT_BUFFER_PCT
-    )
-
-    return round(raw, 2)
-
 
 def calculate_exit_prices(
-    entry: float,
+    entry_price: float,
     atr: float,
-) -> Tuple[float, float]:
-
-    if entry <= 0 or atr <= 0:
-        return 0.0, 0.0
+) -> Dict[str, float]:
 
     stop = (
-        entry
-        - ATR_MULTIPLIER_STOP * atr
+        entry_price
+        - STOP_ATR * atr
     )
 
     target = (
-        entry
-        + ATR_MULTIPLIER_TARGET * atr
+        entry_price
+        + TARGET_ATR * atr
     )
 
-    return (
-        round(stop, 2),
-        round(target, 2),
-    )
-
-
-# ============================================================================
-# COMPATIBILITY HELPERS
-# ============================================================================
-
-def check_signal(
-    row: pd.Series,
-) -> bool:
-    """
-    Compatibility helper for older backtests.
-
-    New code should use:
-        analyze_indicators()
-        evaluate_signal()
-
-    This function supports rows that already contain the
-    older indicator columns.
-    """
-
-    required = {
-        "RSI",
-        "VOL_SPIKE",
-        "TREND_4H",
+    return {
+        "stop": float(stop),
+        "target": float(target),
     }
-
-    if not required.issubset(row.index):
-        return False
-
-    try:
-        return bool(
-            row["RSI"] < 30
-            and bool(row["VOL_SPIKE"])
-            and row["TREND_4H"] == "BULLISH"
-        )
-
-    except Exception:
-        return False
-
-
-def calculate_indicators(
-    df: pd.DataFrame,
-    symbol: str = "",
-) -> pd.DataFrame:
-    """
-    Compatibility implementation for the original v13 backtester.
-
-    This preserves the old column interface while the new v12
-    engine uses analyze_indicators/evaluate_signal directly.
-
-    IMPORTANT:
-    New v12 backtesting should use the new functions above.
-    """
-
-    df = df.copy()
-
-    if isinstance(df.columns, pd.MultiIndex) and symbol:
-
-        try:
-            df = df.xs(
-                symbol,
-                level=1,
-                axis=1,
-            )
-
-        except Exception:
-            try:
-                df = df.xs(
-                    symbol,
-                    level=0,
-                    axis=1,
-                )
-            except Exception:
-                pass
-
-    df = normalize_ohlcv(df)
-
-    if df is None:
-        raise ValueError(
-            "Unable to normalize OHLCV data"
-        )
-
-    df["RSI"] = ta.momentum.rsi(
-        df["Close"],
-        window=RSI_WINDOW,
-    )
-
-    df["VOL_SMA20"] = (
-        df["Volume"]
-        .shift(1)
-        .rolling(20)
-        .mean()
-    )
-
-    df["VOL_SPIKE"] = (
-        df["Volume"]
-        > 1.2 * df["VOL_SMA20"]
-    )
-
-    # Approximate 4H trend from the supplied intraday data.
-    df_4h = (
-        df["Close"]
-        .resample("4h")
-        .last()
-        .dropna()
-        .to_frame("Close")
-    )
-
-    if len(df_4h) > 1:
-        df_4h = df_4h.iloc[:-1]
-
-    df_4h["EMA20"] = ta.trend.ema_indicator(
-        df_4h["Close"],
-        window=EMA_FAST_4H,
-    )
-
-    df_4h["EMA50"] = ta.trend.ema_indicator(
-        df_4h["Close"],
-        window=EMA_SLOW_4H,
-    )
-
-    df_4h["TREND_4H"] = np.where(
-        df_4h["EMA20"] > df_4h["EMA50"],
-        "BULLISH",
-        "BEARISH",
-    )
-
-    df["TREND_4H"] = (
-        df_4h["TREND_4H"]
-        .reindex(
-            df.index,
-            method="ffill",
-        )
-    )
-
-    return df
