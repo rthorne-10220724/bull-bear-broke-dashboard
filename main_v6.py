@@ -1,67 +1,61 @@
-# =====================================================================
-# BULL. BEAR AND BROKE - TRADING ENGINE
-# main_v12_balanced.py
-#
-# Dynamic Momentum Screener with:
-#   - Pullback-in-uptrend selection
-#   - Asset-specific 4H trend confirmation
-#   - Balanced momentum confirmation
-#   - Fail-closed volatility/data filters
-#   - Smart watchlists
-#   - Bracket orders
-#   - Portfolio risk controls
-#
-# IMPORTANT:
-# This strategy has NOT been proven profitable merely because filters
-# were changed. Backtest and paper-trade before using real capital.
-#
-# v12 CHANGES:
-#
-# [FIX 1]
-# 4H trend now belongs to the actual ticker being evaluated.
-# Previous version used SPY for every stock and BTC for every crypto.
-#
-# [FIX 2]
-# Volume spike is no longer a mandatory entry gate.
-# RVOL remains mandatory, while a 1.2x volume spike is bonus confirmation.
-#
-# [FIX 3]
-# MACD no longer has to be improving every single bar.
-# MACD can pass when:
-#   - MACD histogram is positive, OR
-#   - MACD histogram is improving.
-#
-# [FIX 4]
-# RSI hard floor is now actually hard:
-# RSI must be >= 50.
-# RSI reversal/recovery is additional confirmation rather than an escape.
-#
-# [FIX 5]
-# Screener no longer blindly ranks the largest intraday decline as best.
-# It favors modest pullbacks while rejecting extreme intraday weakness.
-#
-# [FIX 6]
-# Crypto position sizing is determined from the symbol rather than
-# incorrectly inspecting the numeric price.
-#
-# [FIX 7]
-# Volatility and data errors fail CLOSED.
-#
-# =====================================================================
+"""
+BULL. BEAR AND BROKE - TRADING ENGINE v12
+==========================================
+
+Hardened momentum / pullback trading engine.
+
+IMPORTANT:
+-----------
+This is NOT guaranteed-profitable code.
+"10/10" refers to the engineering/strategy structure, not expected returns.
+
+Run PAPER_TRADING=true first and validate with:
+- out-of-sample backtesting
+- walk-forward testing
+- realistic commissions/slippage
+- trade-count statistics
+- expectancy
+- profit factor
+- maximum drawdown
+- Sharpe/Sortino
+- regime analysis
+
+Core philosophy:
+---------------
+HARD GATES:
+    - valid market/data state
+    - 4H asset trend bullish
+    - adequate volatility
+    - adequate liquidity
+    - portfolio risk available
+
+SETUP SCORE:
+    - RSI
+    - MACD
+    - short-term EMA structure
+    - pullback quality
+    - volume
+    - breakout/reclaim
+
+This intentionally avoids requiring every indicator to fire simultaneously.
+"""
+
+from __future__ import annotations
 
 import os
 import sys
 import time
 import sqlite3
-import datetime
 import logging
+import datetime as dt
 import zoneinfo
 
+from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
-from typing import Tuple, List, Dict, Optional, Any, Set
+from typing import Optional, Dict, Any, List, Tuple, Set
 
-import pandas as pd
 import numpy as np
+import pandas as pd
 import ta
 import yfinance as yf
 
@@ -87,92 +81,93 @@ from alpaca.data.historical import (
 from alpaca.data.requests import (
     StockBarsRequest,
     CryptoBarsRequest,
-    StockLatestBarRequest,
 )
 
 from alpaca.data.timeframe import TimeFrame
 from alpaca.data.enums import DataFeed
 
 
-# =====================================================================
-# 1. LOGGING SETUP
-# =====================================================================
+# ============================================================================
+# 1. LOGGING
+# ============================================================================
 
 LOG_DIR = "logs"
 os.makedirs(LOG_DIR, exist_ok=True)
 
-logger = logging.getLogger("trading_engine")
+logger = logging.getLogger("bbb_engine")
 logger.setLevel(logging.DEBUG)
 logger.propagate = False
 
-_fmt = logging.Formatter(
+formatter = logging.Formatter(
     "%(asctime)s | %(levelname)-7s | %(filename)s:%(lineno)d | %(message)s"
 )
 
-console_handler = logging.StreamHandler(sys.stdout)
-console_handler.setLevel(logging.DEBUG)
-console_handler.setFormatter(_fmt)
-
-file_handler = RotatingFileHandler(
-    os.path.join(LOG_DIR, "trading_engine.log"),
-    maxBytes=10 * 1024 * 1024,
-    backupCount=5,
-    encoding="utf-8",
-)
-
-file_handler.setLevel(logging.DEBUG)
-file_handler.setFormatter(_fmt)
-
 if not logger.handlers:
-    logger.addHandler(console_handler)
+    console = logging.StreamHandler(sys.stdout)
+    console.setLevel(logging.INFO)
+    console.setFormatter(formatter)
+
+    file_handler = RotatingFileHandler(
+        os.path.join(LOG_DIR, "trading_engine.log"),
+        maxBytes=10 * 1024 * 1024,
+        backupCount=5,
+        encoding="utf-8",
+    )
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(formatter)
+
+    logger.addHandler(console)
     logger.addHandler(file_handler)
 
 
 decision_logger = logging.getLogger("decision_engine")
-decision_logger.setLevel(logging.DEBUG)
+decision_logger.setLevel(logging.INFO)
 decision_logger.propagate = False
 
-decision_file = RotatingFileHandler(
-    os.path.join(LOG_DIR, "decisions.log"),
-    maxBytes=5 * 1024 * 1024,
-    backupCount=3,
-    encoding="utf-8",
-)
-
-decision_file.setFormatter(
-    logging.Formatter("%(asctime)s | %(message)s")
-)
-
 if not decision_logger.handlers:
-    decision_logger.addHandler(decision_file)
+    decision_handler = RotatingFileHandler(
+        os.path.join(LOG_DIR, "decisions.log"),
+        maxBytes=10 * 1024 * 1024,
+        backupCount=5,
+        encoding="utf-8",
+    )
+    decision_handler.setFormatter(
+        logging.Formatter("%(asctime)s | %(message)s")
+    )
+    decision_logger.addHandler(decision_handler)
 
 
-def log_decision(msg: str):
-    decision_logger.info(msg)
-    logger.info(f"DECISION: {msg}")
+def log_decision(message: str) -> None:
+    decision_logger.info(message)
+    logger.info("DECISION: %s", message)
 
 
-# =====================================================================
-# 2. CONFIGURATION & CREDENTIALS
-# =====================================================================
+# ============================================================================
+# 2. ENVIRONMENT
+# ============================================================================
 
 ALPACA_API_KEY = (
-    os.environ.get("APCA_API_KEY_ID")
-    or os.environ.get("ALPACA_API_KEY")
+    os.getenv("APCA_API_KEY_ID")
+    or os.getenv("ALPACA_API_KEY")
 )
 
 ALPACA_SECRET_KEY = (
-    os.environ.get("APCA_API_SECRET_KEY")
-    or os.environ.get("ALPACA_SECRET_KEY")
+    os.getenv("APCA_API_SECRET_KEY")
+    or os.getenv("ALPACA_SECRET_KEY")
 )
 
 PAPER_TRADING = (
-    os.environ.get("PAPER_TRADING", "true").lower() == "true"
+    os.getenv("PAPER_TRADING", "true").strip().lower() == "true"
 )
 
 if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
-    logger.error("Missing Alpaca API credentials!")
+    logger.error("Missing Alpaca API credentials.")
     sys.exit(1)
+
+if not PAPER_TRADING:
+    logger.warning(
+        "LIVE TRADING IS ENABLED. This engine can submit real orders."
+    )
 
 
 trading_client = TradingClient(
@@ -192,11 +187,32 @@ crypto_data_client = CryptoHistoricalDataClient(
 )
 
 
-# =====================================================================
-# 3. STRATEGY CONFIGURATION
-# =====================================================================
+# ============================================================================
+# 3. CONFIGURATION
+# ============================================================================
 
 DB_FILE = os.path.join(LOG_DIR, "trading_state.db")
+
+STOCK_CANDIDATES = [
+    "PLTR",
+    "SOFI",
+    "NIO",
+    "MARA",
+    "RIOT",
+    "HOOD",
+    "RIVN",
+    "SNAP",
+    "AMC",
+    "GME",
+    "PTON",
+    "AAL",
+    "SPY",
+    "QQQ",
+    "AMD",
+    "COIN",
+    "DKNG",
+    "UBER",
+]
 
 CRYPTO_TARGETS = [
     "BTC/USD",
@@ -206,150 +222,132 @@ CRYPTO_TARGETS = [
     "DOGE/USD",
 ]
 
+# Portfolio
 MAX_OPEN_POSITIONS = 3
+MAX_PENDING_ENTRIES = 2
 MAX_TOTAL_ACTIVE_TRADES = 3
 
-ENTRY_COOLDOWN_SECONDS = 120
-
-RISK_PER_TRADE_PCT = 0.01
+# Risk
+RISK_PER_TRADE_PCT = 0.0075
 MAX_POSITION_PCT = 0.15
-
 MAX_DAILY_DRAWDOWN_PCT = 0.04
 
+# Trade frequency
+ENTRY_COOLDOWN_SECONDS = 180
+MAX_NEW_ENTRIES_PER_DAY = 5
 
-# -----------------------------
-# RSI
-# -----------------------------
-
+# Indicators
 RSI_WINDOW = 14
 
-# RSI must be at least 50 for a long.
-RSI_HARD_FLOOR = 50
+EMA_FAST_1M = 9
+EMA_SLOW_1M = 21
 
-# Used for additional confirmation.
-OVERSOLD_RSI = 40
-REVERSAL_RSI = 45
+EMA_FAST_4H = 20
+EMA_SLOW_4H = 50
 
+MACD_FAST = 12
+MACD_SLOW = 26
+MACD_SIGNAL = 9
 
-# -----------------------------
-# EMA
-# -----------------------------
+ATR_WINDOW = 14
 
-EMA_FAST = 20
-EMA_SLOW = 50
-
-
-# -----------------------------
-# Stops / targets
-# -----------------------------
-
-ATR_MULTIPLIER_STOP = 1.5
-ATR_MULTIPLIER_TARGET = 5.25
-
-ENTRY_LIMIT_BUFFER_PCT = 0.0005
-
-
-# -----------------------------
-# Volume / volatility
-# -----------------------------
-
-MIN_ATR_PERCENT = 1.0
+# Entry quality
+MIN_SIGNAL_SCORE = 6
+MAX_ALLOWED_EXTENSION_ATR = 1.25
 MIN_RVOL = 0.70
 
-VOLUME_SPIKE_MULTIPLIER = 1.20
+# ATR exits
+ATR_MULTIPLIER_STOP = 1.50
+ATR_MULTIPLIER_TARGET = 3.75
 
+# Entry price
+ENTRY_LIMIT_BUFFER_PCT = 0.0005
 
-# -----------------------------
-# Pullback screener
-# -----------------------------
-
-# Avoid buying extreme intraday breakdowns.
-MAX_INTRADAY_PULLBACK_PCT = 2.5
-
-# Prefer modest pullbacks.
-PREFERRED_PULLBACK_PCT = 0.25
-
-
-# -----------------------------
 # Cache
-# -----------------------------
-
 CACHE_TTL_4H_SECONDS = 900
+
+# Cycle
+CYCLE_SECONDS = 180
+
+# Trading session
+MARKET_CLOSE_BUFFER_SECONDS = 10 * 60
+
+# Crypto is deliberately disabled for automatic bracket execution
+# until separately validated against the broker's current crypto
+# order-class capabilities.
+ENABLE_CRYPTO_TRADING = False
+
 
 FOUR_HOUR_CACHE: Dict[
     str,
-    Tuple[pd.DataFrame, datetime.datetime]
+    Tuple[pd.DataFrame, dt.datetime]
 ] = {}
 
 
-# =====================================================================
-# 4. DATABASE STATE MANAGEMENT
-# =====================================================================
+# ============================================================================
+# 4. DATABASE
+# ============================================================================
 
-def init_db():
+def db_connection():
+    return sqlite3.connect(DB_FILE, timeout=10)
 
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
 
-    cursor.execute(
-        """
-        CREATE TABLE IF NOT EXISTS state (
-            key TEXT PRIMARY KEY,
-            value TEXT
+def init_db() -> None:
+    with db_connection() as conn:
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS state (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            """
         )
-        """
-    )
 
-    cursor.execute(
-        """
-        CREATE TABLE IF NOT EXISTS trade_journal (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp TEXT,
-            symbol TEXT,
-            side TEXT,
-            qty REAL,
-            entry_price REAL,
-            stop_loss REAL,
-            take_profit REAL,
-            status TEXT
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS trade_journal (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                side TEXT NOT NULL,
+                qty REAL NOT NULL,
+                entry_price REAL NOT NULL,
+                stop_loss REAL NOT NULL,
+                take_profit REAL NOT NULL,
+                status TEXT NOT NULL,
+                score INTEGER,
+                reason TEXT
+            )
+            """
         )
-        """
-    )
 
-    conn.commit()
-    conn.close()
-
-
-def set_db_state(key: str, value: str):
-
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-
-    cursor.execute(
-        """
-        INSERT OR REPLACE INTO state (key, value)
-        VALUES (?, ?)
-        """,
-        (key, value),
-    )
-
-    conn.commit()
-    conn.close()
+        cursor.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_trade_timestamp
+            ON trade_journal(timestamp)
+            """
+        )
 
 
-def get_db_state(key: str) -> Optional[str]:
+def set_state(key: str, value: str) -> None:
+    with db_connection() as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO state(key, value)
+            VALUES (?, ?)
+            """,
+            (key, value),
+        )
 
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
 
-    cursor.execute(
-        "SELECT value FROM state WHERE key = ?",
-        (key,),
-    )
-
-    row = cursor.fetchone()
-
-    conn.close()
+def get_state(key: str) -> Optional[str]:
+    with db_connection() as conn:
+        row = conn.execute(
+            "SELECT value FROM state WHERE key = ?",
+            (key,),
+        ).fetchone()
 
     return row[0] if row else None
 
@@ -362,1960 +360,1647 @@ def record_trade(
     stop_loss: float,
     take_profit: float,
     status: str,
-):
+    score: Optional[int] = None,
+    reason: str = "",
+) -> None:
 
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-
-    cursor.execute(
-        """
-        INSERT INTO trade_journal (
-            timestamp,
-            symbol,
-            side,
-            qty,
-            entry_price,
-            stop_loss,
-            take_profit,
-            status
+    with db_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO trade_journal (
+                timestamp,
+                symbol,
+                side,
+                qty,
+                entry_price,
+                stop_loss,
+                take_profit,
+                status,
+                score,
+                reason
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                dt.datetime.now(dt.timezone.utc).isoformat(),
+                symbol,
+                side,
+                qty,
+                entry_price,
+                stop_loss,
+                take_profit,
+                status,
+                score,
+                reason,
+            ),
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            datetime.datetime.now(
-                datetime.timezone.utc
-            ).isoformat(),
-            symbol,
-            side,
-            qty,
-            entry_price,
-            stop_loss,
-            take_profit,
-            status,
-        ),
-    )
-
-    conn.commit()
-    conn.close()
 
 
-# =====================================================================
-# 5. COOLDOWN MANAGEMENT
-# =====================================================================
+# ============================================================================
+# 5. DAILY STATE
+# ============================================================================
+
+def utc_date_string() -> str:
+    return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d")
+
+
+def daily_entry_key() -> str:
+    return f"entries:{utc_date_string()}"
+
+
+def get_daily_entry_count() -> int:
+    value = get_state(daily_entry_key())
+
+    try:
+        return int(value) if value else 0
+    except ValueError:
+        return 0
+
+
+def increment_daily_entry_count() -> None:
+    count = get_daily_entry_count()
+    set_state(daily_entry_key(), str(count + 1))
+
 
 def cooldown_key(symbol: str) -> str:
-
-    clean_symbol = symbol.replace("/", "_")
-
-    return f"last_entry_time:{clean_symbol}"
+    return f"cooldown:{symbol.replace('/', '_')}"
 
 
-def is_symbol_on_cooldown(symbol: str) -> bool:
-
-    value = get_db_state(
-        cooldown_key(symbol)
-    )
+def is_on_cooldown(symbol: str) -> bool:
+    value = get_state(cooldown_key(symbol))
 
     if not value:
         return False
 
     try:
-
-        last_entry = float(value)
-
-        elapsed = time.time() - last_entry
-
-        return elapsed < ENTRY_COOLDOWN_SECONDS
-
+        return (
+            time.time() - float(value)
+            < ENTRY_COOLDOWN_SECONDS
+        )
     except (TypeError, ValueError):
-
         return False
 
 
-def set_symbol_cooldown(symbol: str):
-
-    set_db_state(
+def set_cooldown(symbol: str) -> None:
+    set_state(
         cooldown_key(symbol),
         str(time.time()),
     )
 
 
-def cooldown_remaining(symbol: str) -> int:
+# ============================================================================
+# 6. DATA HELPERS
+# ============================================================================
 
-    value = get_db_state(
-        cooldown_key(symbol)
-    )
+def normalize_ohlcv(df: pd.DataFrame) -> Optional[pd.DataFrame]:
+    if df is None or df.empty:
+        return None
 
-    if not value:
-        return 0
+    df = df.copy()
 
-    try:
+    rename_map = {
+        "open": "Open",
+        "high": "High",
+        "low": "Low",
+        "close": "Close",
+        "volume": "Volume",
+    }
 
-        elapsed = time.time() - float(value)
+    df.rename(columns=rename_map, inplace=True)
 
-        remaining = ENTRY_COOLDOWN_SECONDS - elapsed
+    required = [
+        "Open",
+        "High",
+        "Low",
+        "Close",
+        "Volume",
+    ]
 
-        return max(
-            0,
-            int(remaining)
+    if not all(column in df.columns for column in required):
+        return None
+
+    df = df[required].copy()
+
+    for column in required:
+        df[column] = pd.to_numeric(
+            df[column],
+            errors="coerce",
         )
 
-    except (TypeError, ValueError):
+    df.dropna(inplace=True)
 
-        return 0
+    if len(df) < 30:
+        return None
+
+    return df
 
 
-# =====================================================================
-# 6. 4H MARKET DATA
-# =====================================================================
+def fetch_1m_bars(
+    ticker: str,
+    limit: int = 180,
+    retries: int = 3,
+) -> Optional[pd.DataFrame]:
+
+    end = dt.datetime.now(dt.timezone.utc)
+    start = end - dt.timedelta(
+        minutes=limit + 180
+    )
+
+    is_crypto = "/" in ticker
+
+    for attempt in range(retries):
+        try:
+            if is_crypto:
+                request = CryptoBarsRequest(
+                    symbol_or_symbols=ticker,
+                    timeframe=TimeFrame.Minute,
+                    start=start,
+                    end=end,
+                )
+
+                response = crypto_data_client.get_crypto_bars(
+                    request
+                )
+
+            else:
+                request = StockBarsRequest(
+                    symbol_or_symbols=ticker,
+                    timeframe=TimeFrame.Minute,
+                    start=start,
+                    end=end,
+                    feed=DataFeed.IEX,
+                )
+
+                response = stock_data_client.get_stock_bars(
+                    request
+                )
+
+            df = response.df
+
+            if isinstance(df.index, pd.MultiIndex):
+                try:
+                    df = df.xs(
+                        ticker,
+                        level=0,
+                    )
+                except Exception:
+                    return None
+
+            df = normalize_ohlcv(df)
+
+            if df is None:
+                raise ValueError("Invalid/empty OHLCV data")
+
+            return df.tail(limit)
+
+        except Exception as exc:
+            logger.warning(
+                "[%s] 1m data attempt %s/%s failed: %s",
+                ticker,
+                attempt + 1,
+                retries,
+                exc,
+            )
+
+            if attempt < retries - 1:
+                time.sleep(1.5)
+
+    return None
+
 
 def fetch_4h_bars_cached(
     ticker: str,
 ) -> Optional[pd.DataFrame]:
 
-    now_utc = datetime.datetime.now(
-        datetime.timezone.utc
-    )
+    now = dt.datetime.now(dt.timezone.utc)
 
-    if ticker in FOUR_HOUR_CACHE:
+    cached = FOUR_HOUR_CACHE.get(ticker)
 
-        cached_df, last_fetch = FOUR_HOUR_CACHE[ticker]
+    if cached:
+        cached_df, cached_at = cached
 
         if (
-            now_utc - last_fetch
+            now - cached_at
         ).total_seconds() < CACHE_TTL_4H_SECONDS:
-
             return cached_df
 
     try:
+        yf_ticker = ticker.replace("/", "-")
 
-        ticker_obj = yf.Ticker(ticker)
+        obj = yf.Ticker(yf_ticker)
 
-        df_4h = ticker_obj.history(
+        hourly = obj.history(
             period="60d",
             interval="60m",
+            auto_adjust=False,
         )
 
-        if df_4h.empty:
-
-            logger.warning(
-                f"[{ticker}] Empty 4H source data."
-            )
-
+        if hourly.empty:
             return None
 
-        df_4h = df_4h.resample(
-            "4h",
-            origin="start",
-        ).agg(
-            {
-                "Open": "first",
-                "High": "max",
-                "Low": "min",
-                "Close": "last",
-                "Volume": "sum",
-            }
-        ).dropna()
+        hourly = normalize_ohlcv(hourly)
 
-        # Remove potentially incomplete candle.
-        if len(df_4h) > 1:
-            df_4h = df_4h.iloc[:-1]
+        if hourly is None:
+            return None
 
-        if len(df_4h) < EMA_SLOW:
-
-            logger.warning(
-                f"[{ticker}] Only {len(df_4h)} "
-                "4H bars available."
+        four_hour = (
+            hourly
+            .resample("4h")
+            .agg(
+                {
+                    "Open": "first",
+                    "High": "max",
+                    "Low": "min",
+                    "Close": "last",
+                    "Volume": "sum",
+                }
             )
+            .dropna()
+        )
 
+        # Never use the currently forming 4H candle.
+        if len(four_hour) > 1:
+            four_hour = four_hour.iloc[:-1]
+
+        if len(four_hour) < EMA_SLOW_4H:
+            logger.warning(
+                "[%s] insufficient 4H history: %s bars",
+                ticker,
+                len(four_hour),
+            )
             return None
 
         FOUR_HOUR_CACHE[ticker] = (
-            df_4h,
-            now_utc,
+            four_hour,
+            now,
         )
 
-        return df_4h
+        return four_hour
 
-    except Exception as e:
-
-        logger.error(
-            f"[{ticker}] Failed fetching 4H bars: {e}"
+    except Exception as exc:
+        logger.warning(
+            "[%s] 4H data error: %s",
+            ticker,
+            exc,
         )
 
-        # Use previous valid cache if available.
         if ticker in FOUR_HOUR_CACHE:
             return FOUR_HOUR_CACHE[ticker][0]
 
         return None
 
 
-# =====================================================================
-# 7. DYNAMIC MOMENTUM SCREENER
-# =====================================================================
-
-def calculate_pullback_score(
-    intraday_change_pct: float,
-) -> Optional[float]:
-    """
-    Produces a balanced pullback score.
-
-    We do NOT automatically reward extreme weakness.
-
-    Desired behavior:
-
-        +0.1%  -> good
-        -0.5%  -> very good
-        -1.0%  -> good
-        -2.0%  -> weaker
-        -3.0%  -> reject
-
-    The goal is a pullback inside strength, not a falling knife.
-    """
-
-    # Extreme weakness is rejected.
-    if (
-        intraday_change_pct
-        < -MAX_INTRADAY_PULLBACK_PCT
-    ):
-        return None
-
-    # Large positive extension is less attractive.
-    if intraday_change_pct > 2.0:
-        return -intraday_change_pct
-
-    # Ideal zone is a modest pullback.
-    distance_from_preferred = abs(
-        intraday_change_pct
-        + PREFERRED_PULLBACK_PCT
-    )
-
-    score = -distance_from_preferred
-
-    return score
-
-
-def get_dynamic_momentum_watchlist(
-    max_stocks: int = 15,
-) -> List[str]:
-
-    """
-    Scans candidate equities and ranks them by:
-
-        1. Individual 4H uptrend
-        2. Healthy/modest intraday pullback
-        3. Avoidance of extreme weakness
-
-    Crypto targets are appended separately.
-    """
-
-    candidate_stocks = [
-        "PLTR",
-        "SOFI",
-        "NIO",
-        "MARA",
-        "RIOT",
-        "HOOD",
-        "RIVN",
-        "SNAP",
-        "AMC",
-        "GME",
-        "PTON",
-        "AAL",
-        "SPY",
-        "QQQ",
-        "AMD",
-        "COIN",
-        "DKNG",
-        "UBER",
-    ]
-
-    scored_targets = []
-
-    try:
-
-        request_params = StockLatestBarRequest(
-            symbol_or_symbols=candidate_stocks
-        )
-
-        latest_bars = (
-            stock_data_client
-            .get_stock_latest_bar(
-                request_params
-            )
-        )
-
-        for symbol, bar in latest_bars.items():
-
-            if not bar or bar.open <= 0:
-                continue
-
-            intraday_change_pct = (
-                (bar.close - bar.open)
-                / bar.open
-                * 100
-            )
-
-            # ---------------------------------------------------------
-            # Individual stock 4H trend
-            # ---------------------------------------------------------
-
-            df_4h = fetch_4h_bars_cached(
-                symbol
-            )
-
-            if (
-                df_4h is None
-                or len(df_4h) < EMA_SLOW
-            ):
-                continue
-
-            close_4h = df_4h["Close"]
-
-            ema20 = (
-                ta.trend
-                .ema_indicator(
-                    close_4h,
-                    window=EMA_FAST,
-                )
-                .iloc[-1]
-            )
-
-            ema50 = (
-                ta.trend
-                .ema_indicator(
-                    close_4h,
-                    window=EMA_SLOW,
-                )
-                .iloc[-1]
-            )
-
-            if ema20 < ema50:
-                continue
-
-            # ---------------------------------------------------------
-            # Pullback score
-            # ---------------------------------------------------------
-
-            pullback_score = calculate_pullback_score(
-                intraday_change_pct
-            )
-
-            if pullback_score is None:
-                continue
-
-            scored_targets.append(
-                (
-                    symbol,
-                    pullback_score,
-                    intraday_change_pct,
-                )
-            )
-
-        scored_targets.sort(
-            key=lambda x: x[1],
-            reverse=True,
-        )
-
-        top_stocks = [
-            item[0]
-            for item in scored_targets[:max_stocks]
-        ]
-
-        logger.info(
-            "[SCREENER] Pullback-in-uptrend watchlist: "
-            f"{top_stocks}"
-        )
-
-        return top_stocks + CRYPTO_TARGETS
-
-    except Exception as e:
-
-        logger.warning(
-            "[SCREENER] Failed dynamic stock scan: "
-            f"{e}. Falling back to default list."
-        )
-
-        return [
-            "PLTR",
-            "SOFI",
-            "MARA",
-            "RIOT",
-            "SPY",
-            "QQQ",
-        ] + CRYPTO_TARGETS
-
-
-# =====================================================================
-# 8. 1-MINUTE MARKET DATA
-# =====================================================================
-
-def fetch_1m_bars(
-    ticker: str,
-    limit: int = 120,
-    retries: int = 3,
-    delay: int = 2,
-) -> Optional[pd.DataFrame]:
-
-    end_dt = datetime.datetime.now(
-        datetime.timezone.utc
-    )
-
-    start_dt = (
-        end_dt
-        - datetime.timedelta(
-            minutes=limit + 120
-        )
-    )
-
-    is_crypto = "/" in ticker
-
-    for attempt in range(retries):
-
-        try:
-
-            if is_crypto:
-
-                request_params = CryptoBarsRequest(
-                    symbol_or_symbols=ticker,
-                    timeframe=TimeFrame.Minute,
-                    start=start_dt,
-                    end=end_dt,
-                )
-
-                bars = (
-                    crypto_data_client
-                    .get_crypto_bars(
-                        request_params
-                    )
-                )
-
-            else:
-
-                request_params = StockBarsRequest(
-                    symbol_or_symbols=ticker,
-                    timeframe=TimeFrame.Minute,
-                    start=start_dt,
-                    end=end_dt,
-                    feed=DataFeed.IEX,
-                )
-
-                bars = (
-                    stock_data_client
-                    .get_stock_bars(
-                        request_params
-                    )
-                )
-
-            df = bars.df
-
-            if df.empty:
-
-                if attempt < retries - 1:
-                    time.sleep(delay)
-                    continue
-
-                return None
-
-            if isinstance(
-                df.index,
-                pd.MultiIndex,
-            ):
-
-                df = df.xs(
-                    ticker,
-                    level=0,
-                )
-
-            df = df.sort_index()
-
-            return df.tail(limit)
-
-        except Exception as e:
-
-            logger.warning(
-                f"[{ticker}] 1m data attempt "
-                f"{attempt + 1}/{retries} failed: {e}"
-            )
-
-            if attempt < retries - 1:
-                time.sleep(delay)
-
-    return None
-
-
-# =====================================================================
-# 9. DATA HELPERS
-# =====================================================================
-
-def get_column(
-    df: pd.DataFrame,
-    lower_name: str,
-    upper_name: str,
-) -> pd.Series:
-
-    if lower_name in df.columns:
-        return df[lower_name]
-
-    if upper_name in df.columns:
-        return df[upper_name]
-
-    raise KeyError(
-        f"Neither {lower_name} nor {upper_name} "
-        "found in dataframe."
-    )
-
-
-# =====================================================================
-# 10. ATR
-# =====================================================================
+# ============================================================================
+# 7. INDICATORS
+# ============================================================================
 
 def calculate_atr(
-    high: pd.Series,
-    low: pd.Series,
-    close: pd.Series,
-    window: int = 14,
+    df: pd.DataFrame,
+    window: int = ATR_WINDOW,
 ) -> float:
+
+    high = df["High"]
+    low = df["Low"]
+    close = df["Close"]
 
     previous_close = close.shift(1)
 
-    high_low = high - low
-
-    high_close = (
-        high - previous_close
-    ).abs()
-
-    low_close = (
-        low - previous_close
-    ).abs()
-
     true_range = pd.concat(
         [
-            high_low,
-            high_close,
-            low_close,
+            high - low,
+            (high - previous_close).abs(),
+            (low - previous_close).abs(),
         ],
         axis=1,
     ).max(axis=1)
 
-    atr = (
-        true_range
-        .rolling(window)
-        .mean()
-        .iloc[-1]
-    )
+    atr = true_range.rolling(window).mean().iloc[-1]
+
+    if pd.isna(atr):
+        return 0.0
 
     return float(atr)
 
 
-# =====================================================================
-# 11. VOLATILITY / RVOL FILTER
-# =====================================================================
+def calculate_rvol(
+    volume: pd.Series,
+    window: int = 20,
+) -> float:
 
-def passes_volatility_filter(
-    df_1m: pd.DataFrame,
-) -> bool:
+    if len(volume) < window + 1:
+        return 0.0
 
-    """
-    HARD GATE.
+    baseline = volume.iloc[-window - 1:-1].mean()
 
-    Requires:
+    if baseline <= 0:
+        return 0.0
 
-        ATR >= 1% of current price
-        RVOL >= 0.70
+    return float(volume.iloc[-1] / baseline)
 
-    Any calculation failure rejects the trade.
-    """
-
-    try:
-
-        close = get_column(
-            df_1m,
-            "close",
-            "Close",
-        )
-
-        high = get_column(
-            df_1m,
-            "high",
-            "High",
-        )
-
-        low = get_column(
-            df_1m,
-            "low",
-            "Low",
-        )
-
-        volume = get_column(
-            df_1m,
-            "volume",
-            "Volume",
-        )
-
-        atr = calculate_atr(
-            high,
-            low,
-            close,
-            window=14,
-        )
-
-        current_price = float(
-            close.iloc[-1]
-        )
-
-        if current_price <= 0:
-            return False
-
-        if not np.isfinite(atr) or atr <= 0:
-            return False
-
-        atr_percentage = (
-            atr
-            / current_price
-            * 100
-        )
-
-        avg_vol = (
-            volume
-            .rolling(window=20)
-            .mean()
-            .iloc[-1]
-        )
-
-        current_vol = volume.iloc[-1]
-
-        if (
-            pd.isna(avg_vol)
-            or avg_vol <= 0
-        ):
-            return False
-
-        rvol = (
-            current_vol
-            / avg_vol
-        )
-
-        return (
-            atr_percentage >= MIN_ATR_PERCENT
-            and rvol >= MIN_RVOL
-        )
-
-    except Exception as e:
-
-        logger.warning(
-            "Volatility filter failed. "
-            f"Rejecting trade: {e}"
-        )
-
-        return False
-
-
-# =====================================================================
-# 12. INDICATOR ANALYSIS
-# =====================================================================
 
 def analyze_indicators(
     df_1m: pd.DataFrame,
-    df_4h: Optional[pd.DataFrame] = None,
+    df_4h: pd.DataFrame,
 ) -> Dict[str, Any]:
 
-    close_1m = get_column(
-        df_1m,
-        "close",
-        "Close",
-    )
+    close = df_1m["Close"]
+    high = df_1m["High"]
+    low = df_1m["Low"]
+    volume = df_1m["Volume"]
 
-    high_1m = get_column(
-        df_1m,
-        "high",
-        "High",
-    )
+    price = float(close.iloc[-1])
 
-    low_1m = get_column(
-        df_1m,
-        "low",
-        "Low",
-    )
-
-    volume_1m = get_column(
-        df_1m,
-        "volume",
-        "Volume",
-    )
-
-    # =================================================================
+    # ------------------------------------------------------------------
     # RSI
-    # =================================================================
+    # ------------------------------------------------------------------
 
     rsi_series = ta.momentum.rsi(
-        close_1m,
+        close,
         window=RSI_WINDOW,
     )
 
-    rsi = float(
-        rsi_series.iloc[-1]
-    )
-
-    previous_rsi = float(
-        rsi_series.iloc[-2]
-    )
-
-    rsi_reversal = (
-        previous_rsi < OVERSOLD_RSI
-        and rsi >= OVERSOLD_RSI
-    )
+    rsi = float(rsi_series.iloc[-1])
+    previous_rsi = float(rsi_series.iloc[-2])
 
     rsi_recovering = (
         rsi > previous_rsi
-        and rsi >= REVERSAL_RSI
+        and rsi >= 45
     )
 
-    # =================================================================
-    # Volume
-    # =================================================================
+    rsi_bullish = rsi >= 50
 
-    avg_vol_20 = (
-        volume_1m
-        .rolling(window=20)
-        .mean()
-        .iloc[-1]
+    # ------------------------------------------------------------------
+    # 1m EMA structure
+    # ------------------------------------------------------------------
+
+    ema9 = ta.trend.ema_indicator(
+        close,
+        window=EMA_FAST_1M,
     )
 
-    current_vol = volume_1m.iloc[-1]
-
-    if (
-        pd.isna(avg_vol_20)
-        or avg_vol_20 <= 0
-    ):
-
-        rvol = 0.0
-        volume_spike = False
-
-    else:
-
-        rvol = (
-            current_vol
-            / avg_vol_20
-        )
-
-        volume_spike = (
-            rvol >= VOLUME_SPIKE_MULTIPLIER
-        )
-
-    # =================================================================
-    # 1M EMA structure
-    # =================================================================
-
-    ema_fast_1m = (
-        ta.trend
-        .ema_indicator(
-            close_1m,
-            window=9,
-        )
+    ema21 = ta.trend.ema_indicator(
+        close,
+        window=EMA_SLOW_1M,
     )
 
-    ema_slow_1m = (
-        ta.trend
-        .ema_indicator(
-            close_1m,
-            window=21,
-        )
-    )
+    ema9_now = float(ema9.iloc[-1])
+    ema21_now = float(ema21.iloc[-1])
 
     short_term_bullish = (
-        close_1m.iloc[-1]
-        > ema_fast_1m.iloc[-1]
-        and
-        ema_fast_1m.iloc[-1]
-        >= ema_slow_1m.iloc[-1]
+        price > ema9_now
+        and ema9_now >= ema21_now
     )
 
-    # =================================================================
-    # Short-term breakout
-    # =================================================================
+    # ------------------------------------------------------------------
+    # MACD on 15-minute closes
+    # ------------------------------------------------------------------
 
-    recent_high = (
-        high_1m
-        .iloc[-6:-1]
-        .max()
-    )
-
-    breakout_confirmation = (
-        close_1m.iloc[-1]
-        >= recent_high
-    )
-
-    # =================================================================
-    # 15M MACD
-    # =================================================================
-
-    close_15m = (
-        close_1m
-        .resample("15min")
-        .last()
-        .dropna()
-    )
+    close_15m = close.resample("15min").last().dropna()
 
     macd_diff = 0.0
-    previous_macd_diff = 0.0
+    macd_previous = 0.0
 
-    macd_improving = False
-    macd_bullish = False
+    macd_available = False
 
-    if len(close_15m) >= 35:
-
-        macd_series = ta.trend.macd_diff(
+    if len(close_15m) >= 40:
+        macd = ta.trend.macd_diff(
             close_15m,
-            window_slow=26,
-            window_fast=12,
-            window_sign=9,
+            window_slow=MACD_SLOW,
+            window_fast=MACD_FAST,
+            window_sign=MACD_SIGNAL,
         )
 
-        macd_diff = float(
-            macd_series.iloc[-1]
+        if len(macd.dropna()) >= 2:
+            macd_diff = float(macd.iloc[-1])
+            macd_previous = float(macd.iloc[-2])
+            macd_available = True
+
+    macd_improving = (
+        macd_available
+        and macd_diff >= macd_previous
+    )
+
+    macd_positive = (
+        macd_available
+        and macd_diff > 0
+    )
+
+    # ------------------------------------------------------------------
+    # Volume
+    # ------------------------------------------------------------------
+
+    rvol = calculate_rvol(volume)
+
+    volume_spike = (
+        rvol >= 1.20
+    )
+
+    # ------------------------------------------------------------------
+    # ATR
+    # ------------------------------------------------------------------
+
+    atr = calculate_atr(df_1m)
+
+    atr_pct = (
+        atr / price * 100
+        if price > 0
+        else 0
+    )
+
+    # ------------------------------------------------------------------
+    # Recent structure
+    # ------------------------------------------------------------------
+
+    previous_high = float(
+        high.iloc[-6:-1].max()
+    )
+
+    breakout = price >= previous_high
+
+    # Pullback quality:
+    #
+    # We want price near the short EMA structure,
+    # but not collapsing far below it.
+    #
+    distance_from_ema21_atr = (
+        abs(price - ema21_now) / atr
+        if atr > 0
+        else 999
+    )
+
+    healthy_pullback = (
+        price >= ema21_now - (0.75 * atr)
+        and distance_from_ema21_atr <= 1.50
+    )
+
+    # Avoid buying extreme extension.
+    extension_atr = (
+        (price - ema21_now) / atr
+        if atr > 0
+        else 999
+    )
+
+    not_overextended = (
+        extension_atr <= MAX_ALLOWED_EXTENSION_ATR
+    )
+
+    # ------------------------------------------------------------------
+    # 4H trend
+    # ------------------------------------------------------------------
+
+    close_4h = df_4h["Close"]
+
+    ema20_4h = ta.trend.ema_indicator(
+        close_4h,
+        window=EMA_FAST_4H,
+    )
+
+    ema50_4h = ta.trend.ema_indicator(
+        close_4h,
+        window=EMA_SLOW_4H,
+    )
+
+    ema20_value = float(ema20_4h.iloc[-1])
+    ema50_value = float(ema50_4h.iloc[-1])
+
+    trend_4h = (
+        "BULLISH"
+        if ema20_value > ema50_value
+        else "BEARISH"
+    )
+
+    # Require actual slope confirmation too.
+    if len(ema20_4h) >= 4:
+        ema20_slope_positive = (
+            ema20_4h.iloc[-1]
+            > ema20_4h.iloc[-4]
         )
-
-        previous_macd_diff = float(
-            macd_series.iloc[-2]
-        )
-
-        macd_improving = (
-            macd_diff
-            >= previous_macd_diff
-        )
-
-        macd_bullish = (
-            macd_diff > 0
-        )
-
-    # =================================================================
-    # 15M ATR
-    # =================================================================
-
-    df_15m = pd.DataFrame(
-        {
-            "Open": get_column(
-                df_1m,
-                "open",
-                "Open",
-            ).resample("15min").first(),
-
-            "High": high_1m.resample(
-                "15min"
-            ).max(),
-
-            "Low": low_1m.resample(
-                "15min"
-            ).min(),
-
-            "Close": close_1m.resample(
-                "15min"
-            ).last(),
-        }
-    ).dropna()
-
-    if len(df_15m) >= 15:
-
-        atr_15m = calculate_atr(
-            df_15m["High"],
-            df_15m["Low"],
-            df_15m["Close"],
-        )
-
     else:
-
-        atr_15m = (
-            float(close_1m.iloc[-1])
-            * 0.01
-        )
-
-    # =================================================================
-    # ASSET-SPECIFIC 4H TREND
-    # =================================================================
-
-    trend_4h = "UNKNOWN"
-
-    ema_20_4h = np.nan
-    ema_50_4h = np.nan
-
-    if (
-        df_4h is not None
-        and len(df_4h) >= EMA_SLOW
-    ):
-
-        close_4h = df_4h["Close"]
-
-        ema_20_4h = (
-            ta.trend
-            .ema_indicator(
-                close_4h,
-                window=EMA_FAST,
-            )
-            .iloc[-1]
-        )
-
-        ema_50_4h = (
-            ta.trend
-            .ema_indicator(
-                close_4h,
-                window=EMA_SLOW,
-            )
-            .iloc[-1]
-        )
-
-        if (
-            np.isfinite(ema_20_4h)
-            and np.isfinite(ema_50_4h)
-        ):
-
-            trend_4h = (
-                "BULLISH"
-                if ema_20_4h >= ema_50_4h
-                else "BEARISH"
-            )
-
-    # =================================================================
-    # Pullback / extension context
-    # =================================================================
-
-    latest_price = float(
-        close_1m.iloc[-1]
-    )
-
-    recent_20_high = float(
-        high_1m
-        .tail(20)
-        .max()
-    )
-
-    distance_from_recent_high_pct = (
-        (latest_price - recent_20_high)
-        / recent_20_high
-        * 100
-    )
+        ema20_slope_positive = False
 
     return {
-
+        "price": price,
         "rsi": rsi,
-
         "previous_rsi": previous_rsi,
-
-        "rsi_reversal": rsi_reversal,
-
         "rsi_recovering": rsi_recovering,
-
-        "rvol": rvol,
-
-        "volume_spike": volume_spike,
-
-        "macd_diff": macd_diff,
-
-        "previous_macd_diff": previous_macd_diff,
-
-        "macd_improving": macd_improving,
-
-        "macd_bullish": macd_bullish,
-
+        "rsi_bullish": rsi_bullish,
+        "ema9": ema9_now,
+        "ema21": ema21_now,
         "short_term_bullish": short_term_bullish,
-
-        "breakout_confirmation": breakout_confirmation,
-
+        "macd_available": macd_available,
+        "macd_diff": macd_diff,
+        "macd_improving": macd_improving,
+        "macd_positive": macd_positive,
+        "rvol": rvol,
+        "volume_spike": volume_spike,
+        "atr": atr,
+        "atr_pct": atr_pct,
+        "breakout": breakout,
+        "healthy_pullback": healthy_pullback,
+        "extension_atr": extension_atr,
+        "not_overextended": not_overextended,
         "trend_4h": trend_4h,
-
-        "ema_20_4h": ema_20_4h,
-
-        "ema_50_4h": ema_50_4h,
-
-        "latest_price": latest_price,
-
-        "atr_15m": (
-            atr_15m
-            if np.isfinite(atr_15m)
-            and atr_15m > 0
-            else latest_price * 0.01
-        ),
-
-        "distance_from_recent_high_pct":
-            distance_from_recent_high_pct,
+        "ema20_4h": ema20_value,
+        "ema50_4h": ema50_value,
+        "ema20_slope_positive": ema20_slope_positive,
     }
 
 
-# =====================================================================
-# 13. BALANCED SIGNAL ENGINE
-# =====================================================================
+# ============================================================================
+# 8. VOLATILITY / DATA QUALITY
+# ============================================================================
 
-def bullish_signal(
+def passes_data_quality(
+    df_1m: pd.DataFrame,
     indicators: Dict[str, Any],
-) -> Tuple[bool, List[str]]:
+) -> Tuple[bool, str]:
 
-    reasons = []
+    if len(df_1m) < 60:
+        return False, "insufficient 1m history"
 
-    # =================================================================
-    # HARD GATE #1
-    # Asset-specific 4H trend
-    # =================================================================
+    required_columns = {
+        "Open",
+        "High",
+        "Low",
+        "Close",
+        "Volume",
+    }
 
-    if (
-        indicators["trend_4h"]
-        != "BULLISH"
-    ):
+    if not required_columns.issubset(df_1m.columns):
+        return False, "missing OHLCV columns"
 
-        return False, [
-            "4H trend not bullish "
-            f"({indicators['trend_4h']})"
-        ]
+    if not np.isfinite(
+        df_1m[list(required_columns)].tail(30).to_numpy()
+    ).all():
+        return False, "non-finite market data"
 
-    reasons.append(
-        "4H trend confirmed bullish"
-    )
+    if indicators["price"] <= 0:
+        return False, "invalid price"
 
-    # =================================================================
-    # HARD GATE #2
-    # RSI >= 50
-    # =================================================================
+    if indicators["atr"] <= 0:
+        return False, "invalid ATR"
 
-    rsi = indicators["rsi"]
+    if indicators["rvol"] < MIN_RVOL:
+        return False, "insufficient RVOL"
 
-    if rsi < RSI_HARD_FLOOR:
+    # 1% ATR was too arbitrary as a universal requirement.
+    # Instead require enough movement to justify the stop.
+    if indicators["atr_pct"] < 0.35:
+        return False, "volatility too low"
 
-        return False, [
-            f"RSI below hard floor ({rsi:.1f})"
-        ]
+    return True, "data/volatility valid"
 
-    if indicators["rsi_reversal"]:
 
-        reasons.append(
-            "RSI reversal confirmed"
+# ============================================================================
+# 9. SIGNAL ENGINE
+# ============================================================================
+
+@dataclass
+class SignalResult:
+    valid: bool
+    score: int
+    reasons: List[str]
+    rejection: Optional[str] = None
+
+
+def evaluate_signal(
+    indicators: Dict[str, Any],
+) -> SignalResult:
+
+    reasons: List[str] = []
+    score = 0
+
+    # ------------------------------------------------------------------
+    # HARD TREND GATE
+    # ------------------------------------------------------------------
+
+    if indicators["trend_4h"] != "BULLISH":
+        return SignalResult(
+            valid=False,
+            score=0,
+            reasons=[],
+            rejection=(
+                f"4H trend is "
+                f"{indicators['trend_4h']}"
+            ),
         )
 
+    reasons.append("4H trend bullish")
+
+    if not indicators["ema20_slope_positive"]:
+        return SignalResult(
+            valid=False,
+            score=0,
+            reasons=reasons,
+            rejection="4H EMA20 slope not positive",
+        )
+
+    reasons.append("4H trend slope positive")
+
+    # ------------------------------------------------------------------
+    # EXTENSION GATE
+    # ------------------------------------------------------------------
+
+    if not indicators["not_overextended"]:
+        return SignalResult(
+            valid=False,
+            score=0,
+            reasons=reasons,
+            rejection=(
+                f"price extended "
+                f"{indicators['extension_atr']:.2f} ATR "
+                f"above EMA21"
+            ),
+        )
+
+    # ------------------------------------------------------------------
+    # SCORE
+    # ------------------------------------------------------------------
+
+    # RSI
+    if indicators["rsi_bullish"]:
+        score += 2
+        reasons.append("RSI >= 50")
     elif indicators["rsi_recovering"]:
+        score += 1
+        reasons.append("RSI recovering")
 
-        reasons.append(
-            "RSI recovering"
-        )
+    # MACD
+    if indicators["macd_positive"]:
+        score += 1
+        reasons.append("MACD positive")
 
-    else:
+    if indicators["macd_improving"]:
+        score += 1
+        reasons.append("MACD improving")
 
-        reasons.append(
-            "RSI above 50"
-        )
+    # Short-term structure
+    if indicators["short_term_bullish"]:
+        score += 2
+        reasons.append("1m EMA structure bullish")
 
-    # =================================================================
-    # HARD GATE #3
-    # MACD must either:
-    #
-    #   A) be bullish
-    #       OR
-    #
-    #   B) be improving
-    #
-    # This is less restrictive than requiring acceleration every bar.
-    # =================================================================
+    # Pullback
+    if indicators["healthy_pullback"]:
+        score += 2
+        reasons.append("healthy pullback")
 
-    macd_bullish = indicators[
-        "macd_bullish"
-    ]
+    # Breakout/reclaim
+    if indicators["breakout"]:
+        score += 1
+        reasons.append("micro-breakout")
 
-    macd_improving = indicators[
-        "macd_improving"
-    ]
-
-    if not (
-        macd_bullish
-        or macd_improving
-    ):
-
-        return False, [
-            "MACD neither bullish nor improving"
-        ]
-
-    if macd_bullish:
-
-        reasons.append(
-            "MACD bullish"
-        )
-
-    if macd_improving:
-
-        reasons.append(
-            "MACD improving"
-        )
-
-    # =================================================================
-    # HARD GATE #4
-    # Adequate volume / RVOL
-    #
-    # A volume spike is BONUS confirmation, not mandatory.
-    # =================================================================
-
-    rvol = indicators["rvol"]
-
-    if rvol < MIN_RVOL:
-
-        return False, [
-            f"RVOL too low ({rvol:.2f})"
-        ]
-
+    # Volume
     if indicators["volume_spike"]:
+        score += 1
+        reasons.append("volume expansion")
 
-        reasons.append(
-            f"volume spike confirmed "
-            f"(RVOL {rvol:.2f})"
+    # Minimum setup quality
+    if score < MIN_SIGNAL_SCORE:
+        return SignalResult(
+            valid=False,
+            score=score,
+            reasons=reasons,
+            rejection=(
+                f"signal score {score}/"
+                f"{MIN_SIGNAL_SCORE}"
+            ),
         )
 
-    else:
-
-        reasons.append(
-            f"volume adequate "
-            f"(RVOL {rvol:.2f})"
-        )
-
-    # =================================================================
-    # HARD GATE #5
-    # Short-term price confirmation
-    # =================================================================
-
-    price_confirmation = (
-        indicators["short_term_bullish"]
-        or
-        indicators["breakout_confirmation"]
+    return SignalResult(
+        valid=True,
+        score=score,
+        reasons=reasons,
     )
 
-    if not price_confirmation:
 
-        return False, [
-            "No short-term price confirmation"
-        ]
-
-    if indicators[
-        "short_term_bullish"
-    ]:
-
-        reasons.append(
-            "1M EMA structure bullish"
-        )
-
-    if indicators[
-        "breakout_confirmation"
-    ]:
-
-        reasons.append(
-            "short-term breakout confirmed"
-        )
-
-    # =================================================================
-    # Final signal
-    # =================================================================
-
-    return True, reasons
-
-
-# =====================================================================
-# 14. ACCOUNT / RISK
-# =====================================================================
+# ============================================================================
+# 10. PORTFOLIO RISK
+# ============================================================================
 
 def get_account_equity() -> Optional[float]:
-
     try:
-
         account = trading_client.get_account()
-
         return float(account.equity)
-
-    except Exception as e:
-
+    except Exception as exc:
         logger.error(
-            f"Failed to fetch account equity: {e}"
+            "Unable to retrieve equity: %s",
+            exc,
         )
+        return None
 
+
+def get_account_buying_power() -> Optional[float]:
+    try:
+        account = trading_client.get_account()
+        return float(account.buying_power)
+    except Exception as exc:
+        logger.error(
+            "Unable to retrieve buying power: %s",
+            exc,
+        )
         return None
 
 
 def audit_portfolio_risk_state() -> bool:
-
     """
-    Returns True when trading should stop for this cycle.
+    Returns True if trading should STOP.
     """
 
     try:
-
         account = trading_client.get_account()
 
         equity = float(account.equity)
-
-        last_equity = float(
-            account.last_equity
-        )
+        last_equity = float(account.last_equity)
 
         if last_equity <= 0:
             return False
 
-        drawdown_pct = (
+        drawdown = (
             equity - last_equity
         ) / last_equity
 
-        today_str = (
-            datetime.datetime.now(
-                datetime.timezone.utc
-            ).strftime("%Y-%m-%d")
-        )
+        if drawdown <= -MAX_DAILY_DRAWDOWN_PCT:
 
-        if (
-            get_db_state(
-                "circuit_breaker_date"
-            )
-            == today_str
-        ):
+            today = utc_date_string()
+
+            if get_state("circuit_breaker_date") != today:
+
+                log_decision(
+                    "CIRCUIT BREAKER: "
+                    f"daily drawdown "
+                    f"{drawdown * 100:.2f}%"
+                )
+
+                try:
+                    trading_client.close_all_positions(
+                        cancel_orders=True
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "Failed liquidating portfolio: %s",
+                        exc,
+                    )
+
+                set_state(
+                    "circuit_breaker_date",
+                    today,
+                )
 
             return True
 
-        if (
-            drawdown_pct
-            <= -MAX_DAILY_DRAWDOWN_PCT
-        ):
-
-            log_decision(
-                "CIRCUIT BREAKER TRIPPED! "
-                f"Drawdown={drawdown_pct * 100:.2f}%"
-            )
-
-            try:
-
-                trading_client.close_all_positions(
-                    cancel_orders=True
-                )
-
-            except Exception as close_error:
-
-                logger.error(
-                    "Failed closing positions "
-                    f"after circuit breaker: "
-                    f"{close_error}"
-                )
-
-            set_db_state(
-                "circuit_breaker_date",
-                today_str,
-            )
-
-            return True
-
-    except Exception as e:
-
-        logger.error(
-            f"Error checking portfolio risk state: {e}"
+    except Exception as exc:
+        logger.exception(
+            "Risk audit failed: %s",
+            exc,
         )
+
+        # Fail closed.
+        return True
 
     return False
 
 
-# =====================================================================
-# 15. POSITION SIZING
-# =====================================================================
-
 def calculate_position_size(
     equity: float,
+    buying_power: float,
     price: float,
     atr: float,
-    symbol: str,
-    risk_pct: float = RISK_PER_TRADE_PCT,
 ) -> float:
 
     if (
         equity <= 0
+        or buying_power <= 0
         or price <= 0
         or atr <= 0
     ):
-
         return 0.0
 
-    risk_dollar = (
-        equity
-        * risk_pct
+    risk_dollars = (
+        equity * RISK_PER_TRADE_PCT
     )
 
     stop_distance = (
-        ATR_MULTIPLIER_STOP
-        * atr
+        ATR_MULTIPLIER_STOP * atr
     )
 
     if stop_distance <= 0:
         return 0.0
 
-    shares_by_risk = (
-        risk_dollar
-        / stop_distance
+    qty_by_risk = (
+        risk_dollars / stop_distance
     )
 
-    max_position_dollar = (
-        equity
-        * MAX_POSITION_PCT
+    qty_by_cap = (
+        equity * MAX_POSITION_PCT
+    ) / price
+
+    qty_by_buying_power = (
+        buying_power * 0.95
+    ) / price
+
+    qty = min(
+        qty_by_risk,
+        qty_by_cap,
+        qty_by_buying_power,
     )
 
-    max_shares_by_cap = (
-        max_position_dollar
-        / price
-    )
-
-    shares = min(
-        shares_by_risk,
-        max_shares_by_cap,
-    )
-
-    # Crypto can use fractional quantity.
-    if "/" in symbol:
-
-        return max(
-            0.0,
-            round(
-                shares,
-                4,
-            ),
-        )
-
-    # Equities use whole shares.
-    return float(
-        max(
-            0,
-            int(shares),
-        )
-    )
+    # Stocks are whole-share orders.
+    return float(max(0, int(qty)))
 
 
-# =====================================================================
-# 16. POSITION / ORDER PROTECTION
-# =====================================================================
+# ============================================================================
+# 11. POSITIONS / ORDERS
+# ============================================================================
 
-def get_open_position_symbols() -> Set[str]:
+def get_open_positions() -> Dict[str, Any]:
 
     try:
-
-        positions = (
-            trading_client
-            .get_all_positions()
-        )
+        positions = trading_client.get_all_positions()
 
         return {
-            position.symbol
+            position.symbol: position
             for position in positions
         }
 
-    except Exception as e:
-
+    except Exception as exc:
         logger.error(
-            f"Failed fetching positions: {e}"
+            "Failed fetching positions: %s",
+            exc,
         )
+        return {}
 
-        return set()
 
-
-def get_pending_order_symbols() -> Set[str]:
+def get_open_orders() -> List[Any]:
 
     try:
-
         request = GetOrdersRequest(
             status=QueryOrderStatus.OPEN,
             nested=True,
         )
 
-        orders = (
-            trading_client
-            .get_orders(
-                filter=request
-            )
+        return trading_client.get_orders(
+            filter=request
         )
 
-        return {
-            order.symbol
-            for order in orders
-            if hasattr(order, "symbol")
-        }
-
-    except Exception as e:
-
+    except Exception as exc:
         logger.error(
-            f"Failed fetching pending orders: {e}"
+            "Failed fetching orders: %s",
+            exc,
+        )
+        return []
+
+
+def get_pending_symbols(
+    orders: List[Any],
+) -> Set[str]:
+
+    symbols: Set[str] = set()
+
+    for order in orders:
+        symbol = getattr(
+            order,
+            "symbol",
+            None,
         )
 
-        return set()
+        if symbol:
+            symbols.add(symbol)
+
+    return symbols
 
 
-def symbol_available_for_entry(
+def symbol_available(
     symbol: str,
-    held_symbols: Set[str],
-    pending_symbols: Set[str],
+    positions: Dict[str, Any],
+    pending: Set[str],
 ) -> bool:
 
-    if symbol in held_symbols:
+    if symbol in positions:
         return False
 
-    if symbol in pending_symbols:
+    if symbol in pending:
         return False
 
-    if is_symbol_on_cooldown(symbol):
+    if is_on_cooldown(symbol):
         return False
 
     return True
 
 
-# =====================================================================
-# 17. ORDER EXECUTION
-# =====================================================================
+# ============================================================================
+# 12. MARKET SESSION
+# ============================================================================
 
-def calculate_buy_limit_price(
-    latest_price: float,
-) -> float:
-
-    return round(
-        latest_price
-        * (
-            1
-            + ENTRY_LIMIT_BUFFER_PCT
-        ),
-        2,
-    )
-
-
-def place_long_bracket_order(
-    symbol: str,
-    qty: float,
-    latest_price: float,
-    atr: float,
-) -> Optional[Any]:
-
-    if (
-        qty <= 0
-        or latest_price <= 0
-        or atr <= 0
-    ):
-
-        return None
-
-    entry_price = (
-        calculate_buy_limit_price(
-            latest_price
-        )
-    )
-
-    stop_loss = round(
-        entry_price
-        - (
-            ATR_MULTIPLIER_STOP
-            * atr
-        ),
-        2,
-    )
-
-    take_profit = round(
-        entry_price
-        + (
-            ATR_MULTIPLIER_TARGET
-            * atr
-        ),
-        2,
-    )
-
-    if stop_loss <= 0:
-        return None
-
-    if take_profit <= entry_price:
-        return None
+def market_is_tradeable() -> bool:
 
     try:
-
-        order_data = LimitOrderRequest(
-            symbol=symbol,
-            limit_price=entry_price,
-            qty=qty,
-            side=OrderSide.BUY,
-            time_in_force=TimeInForce.GTC,
-            order_class=OrderClass.BRACKET,
-            stop_loss=StopLossRequest(
-                stop_price=stop_loss
-            ),
-            take_profit=TakeProfitRequest(
-                limit_price=take_profit
-            ),
-        )
-
-        response = (
-            trading_client
-            .submit_order(
-                order_data
-            )
-        )
-
-        set_symbol_cooldown(
-            symbol
-        )
-
-        record_trade(
-            symbol=symbol,
-            side="BUY",
-            qty=qty,
-            entry_price=entry_price,
-            stop_loss=stop_loss,
-            take_profit=take_profit,
-            status="SUBMITTED",
-        )
-
-        log_decision(
-            f"ORDER SUBMITTED | "
-            f"{symbol} BUY {qty} | "
-            f"Entry={entry_price:.2f} | "
-            f"SL={stop_loss:.2f} | "
-            f"TP={take_profit:.2f}"
-        )
-
-        return response
-
-    except Exception as e:
-
-        logger.error(
-            f"Failed placing order "
-            f"for {symbol}: {e}"
-        )
-
-        return None
-
-
-# =====================================================================
-# 18. MARKET SESSION MANAGEMENT
-# =====================================================================
-
-def market_is_tradeable(
-    is_crypto: bool = False,
-) -> bool:
-
-    if is_crypto:
-        return True
-
-    try:
-
-        clock = (
-            trading_client
-            .get_clock()
-        )
+        clock = trading_client.get_clock()
 
         if not clock.is_open:
             return False
 
-        now_et = datetime.datetime.now(
+        now_et = dt.datetime.now(
             zoneinfo.ZoneInfo(
                 "America/New_York"
             )
         )
 
-        market_close = now_et.replace(
+        close = now_et.replace(
             hour=16,
             minute=0,
             second=0,
             microsecond=0,
         )
 
-        seconds_to_close = (
-            market_close - now_et
+        seconds_remaining = (
+            close - now_et
         ).total_seconds()
 
         if (
             0
-            < seconds_to_close
-            <= 600
+            < seconds_remaining
+            <= MARKET_CLOSE_BUFFER_SECONDS
         ):
-
-            log_decision(
-                "Within 10 minutes of "
-                "market close. Liquidating."
+            logger.info(
+                "Market close approaching. "
+                "No new stock entries."
             )
-
-            try:
-
-                trading_client.close_all_positions(
-                    cancel_orders=True
-                )
-
-            except Exception as e:
-
-                logger.error(
-                    "Failed liquidating "
-                    f"near close: {e}"
-                )
-
             return False
 
         return True
 
-    except Exception as e:
-
+    except Exception as exc:
         logger.error(
-            f"Failed checking market clock: {e}"
+            "Market clock failure: %s",
+            exc,
         )
 
         return False
 
 
-# =====================================================================
-# 19. MAIN TRADING CYCLE
-# =====================================================================
+# ============================================================================
+# 13. WATCHLIST
+# ============================================================================
 
-def run_cycle():
+def build_watchlist(
+    max_stocks: int = 12,
+) -> List[str]:
 
-    logger.info(
-        "=== STARTING TRADING CYCLE ==="
+    scored: List[Tuple[str, float]] = []
+
+    for symbol in STOCK_CANDIDATES:
+
+        try:
+            df = fetch_4h_bars_cached(symbol)
+
+            if df is None:
+                continue
+
+            close = df["Close"]
+
+            ema20 = ta.trend.ema_indicator(
+                close,
+                window=EMA_FAST_4H,
+            )
+
+            ema50 = ta.trend.ema_indicator(
+                close,
+                window=EMA_SLOW_4H,
+            )
+
+            if (
+                pd.isna(ema20.iloc[-1])
+                or pd.isna(ema50.iloc[-1])
+            ):
+                continue
+
+            # Hard trend filter.
+            if ema20.iloc[-1] <= ema50.iloc[-1]:
+                continue
+
+            atr = calculate_atr(df)
+
+            if atr <= 0:
+                continue
+
+            price = float(close.iloc[-1])
+
+            # How far price is from EMA20 in ATR units.
+            #
+            # We prefer stocks that remain strong but aren't
+            # extremely extended.
+            extension = (
+                price - ema20.iloc[-1]
+            ) / atr
+
+            if extension > 2.5:
+                continue
+
+            # Favor modest pullbacks / proximity to EMA20.
+            distance_score = -abs(extension)
+
+            slope_bonus = (
+                1.0
+                if ema20.iloc[-1] > ema20.iloc[-4]
+                else 0.0
+            )
+
+            score = (
+                distance_score
+                + slope_bonus
+            )
+
+            scored.append(
+                (symbol, score)
+            )
+
+        except Exception as exc:
+            logger.debug(
+                "[SCREENER] %s failed: %s",
+                symbol,
+                exc,
+            )
+
+    scored.sort(
+        key=lambda x: x[1],
+        reverse=True,
     )
 
-    # =================================================================
-    # Portfolio circuit breaker
-    # =================================================================
+    stocks = [
+        symbol
+        for symbol, _ in scored[:max_stocks]
+    ]
+
+    if ENABLE_CRYPTO_TRADING:
+        stocks.extend(CRYPTO_TARGETS)
+
+    logger.info(
+        "[SCREENER] Watchlist: %s",
+        stocks,
+    )
+
+    return stocks
+
+
+# ============================================================================
+# 14. ORDER PRICING
+# ============================================================================
+
+def calculate_entry_price(
+    latest_price: float,
+) -> float:
+
+    # Small buffer to improve fill probability without
+    # blindly using a market order.
+    raw = latest_price * (
+        1 + ENTRY_LIMIT_BUFFER_PCT
+    )
+
+    return round(raw, 2)
+
+
+def calculate_exit_prices(
+    entry: float,
+    atr: float,
+) -> Tuple[float, float]:
+
+    stop = (
+        entry
+        - ATR_MULTIPLIER_STOP * atr
+    )
+
+    target = (
+        entry
+        + ATR_MULTIPLIER_TARGET * atr
+    )
+
+    return (
+        round(stop, 2),
+        round(target, 2),
+    )
+
+
+# ============================================================================
+# 15. STOCK BRACKET ORDER
+# ============================================================================
+
+def place_stock_bracket(
+    symbol: str,
+    qty: float,
+    price: float,
+    atr: float,
+    score: int,
+    reasons: List[str],
+) -> Optional[Any]:
+
+    if qty <= 0:
+        return None
+
+    entry = calculate_entry_price(price)
+
+    stop, target = calculate_exit_prices(
+        entry,
+        atr,
+    )
+
+    if stop <= 0 or target <= entry:
+        return None
+
+    try:
+
+        request = LimitOrderRequest(
+            symbol=symbol,
+            qty=qty,
+            side=OrderSide.BUY,
+            limit_price=entry,
+            time_in_force=TimeInForce.GTC,
+            order_class=OrderClass.BRACKET,
+            stop_loss=StopLossRequest(
+                stop_price=stop
+            ),
+            take_profit=TakeProfitRequest(
+                limit_price=target
+            ),
+        )
+
+        response = trading_client.submit_order(
+            request
+        )
+
+        set_cooldown(symbol)
+        increment_daily_entry_count()
+
+        record_trade(
+            symbol=symbol,
+            side="BUY",
+            qty=qty,
+            entry_price=entry,
+            stop_loss=stop,
+            take_profit=target,
+            status="SUBMITTED",
+            score=score,
+            reason=" | ".join(reasons),
+        )
+
+        log_decision(
+            f"BUY {symbol} "
+            f"qty={qty} "
+            f"entry={entry:.2f} "
+            f"stop={stop:.2f} "
+            f"target={target:.2f} "
+            f"score={score} "
+            f"| {' | '.join(reasons)}"
+        )
+
+        return response
+
+    except Exception as exc:
+
+        logger.error(
+            "[%s] order submission failed: %s",
+            symbol,
+            exc,
+        )
+
+        return None
+
+
+# ============================================================================
+# 16. STALE ORDER MANAGEMENT
+# ============================================================================
+
+def cancel_stale_orders(
+    orders: List[Any],
+    max_age_minutes: int = 30,
+) -> None:
+
+    now = dt.datetime.now(dt.timezone.utc)
+
+    for order in orders:
+
+        try:
+            status = str(
+                getattr(order, "status", "")
+            ).lower()
+
+            if "open" not in status:
+                continue
+
+            created = getattr(
+                order,
+                "created_at",
+                None,
+            )
+
+            if created is None:
+                continue
+
+            if created.tzinfo is None:
+                created = created.replace(
+                    tzinfo=dt.timezone.utc
+                )
+
+            age = (
+                now - created
+            ).total_seconds() / 60
+
+            if age >= max_age_minutes:
+
+                order_id = getattr(
+                    order,
+                    "id",
+                    None,
+                )
+
+                if order_id:
+
+                    logger.info(
+                        "Cancelling stale order "
+                        "%s (%s minutes old)",
+                        order_id,
+                        age,
+                    )
+
+                    trading_client.cancel_order_by_id(
+                        order_id
+                    )
+
+        except Exception as exc:
+            logger.warning(
+                "Failed processing stale order: %s",
+                exc,
+            )
+
+
+# ============================================================================
+# 17. MAIN SCAN
+# ============================================================================
+
+def run_cycle() -> None:
+
+    logger.info(
+        "========== TRADING CYCLE =========="
+    )
+
+    # ------------------------------------------------------------------
+    # Risk
+    # ------------------------------------------------------------------
 
     if audit_portfolio_risk_state():
+        logger.warning(
+            "Risk circuit breaker active."
+        )
         return
 
-    # =================================================================
-    # Account equity
-    # =================================================================
+    # ------------------------------------------------------------------
+    # Session
+    # ------------------------------------------------------------------
+
+    if not market_is_tradeable():
+        return
+
+    # ------------------------------------------------------------------
+    # Daily limit
+    # ------------------------------------------------------------------
+
+    entries_today = get_daily_entry_count()
+
+    if entries_today >= MAX_NEW_ENTRIES_PER_DAY:
+        logger.info(
+            "Daily entry limit reached: %s",
+            entries_today,
+        )
+        return
+
+    # ------------------------------------------------------------------
+    # Account
+    # ------------------------------------------------------------------
 
     equity = get_account_equity()
+    buying_power = get_account_buying_power()
 
     if (
         equity is None
+        or buying_power is None
         or equity <= 0
+        or buying_power <= 0
     ):
-
         return
 
-    # =================================================================
-    # Existing positions / orders
-    # =================================================================
+    # ------------------------------------------------------------------
+    # Portfolio
+    # ------------------------------------------------------------------
 
-    held_symbols = (
-        get_open_position_symbols()
-    )
+    positions = get_open_positions()
+    orders = get_open_orders()
 
-    pending_symbols = (
-        get_pending_order_symbols()
-    )
+    pending = get_pending_symbols(orders)
 
-    active_symbols = (
-        held_symbols
-        | pending_symbols
+    cancel_stale_orders(orders)
+
+    active_count = (
+        len(positions)
+        + len(pending)
     )
 
     logger.info(
-        f"Portfolio state | "
-        f"Positions={len(held_symbols)} | "
-        f"Pending={len(pending_symbols)} | "
-        f"Active={len(active_symbols)}"
+        "Portfolio | equity=$%.2f "
+        "buying_power=$%.2f "
+        "positions=%s "
+        "pending=%s",
+        equity,
+        buying_power,
+        len(positions),
+        len(pending),
     )
 
-    if (
-        len(active_symbols)
-        >= MAX_TOTAL_ACTIVE_TRADES
-    ):
-
+    if active_count >= MAX_TOTAL_ACTIVE_TRADES:
         logger.info(
             "Maximum active trade capacity reached."
         )
-
         return
 
-    # =================================================================
-    # Dynamic watchlist
-    # =================================================================
+    # ------------------------------------------------------------------
+    # Watchlist
+    # ------------------------------------------------------------------
 
-    current_targets = (
-        get_dynamic_momentum_watchlist(
-            max_stocks=12
-        )
+    watchlist = build_watchlist(
+        max_stocks=12
     )
 
-    logger.info(
-        f"[WATCHLIST] {current_targets}"
-    )
+    for symbol in watchlist:
 
-    # =================================================================
-    # Scan targets
-    # =================================================================
+        try:
 
-    for ticker in current_targets:
-
-        is_crypto_target = (
-            "/" in ticker
-        )
-
-        # -------------------------------------------------------------
-        # Market session
-        # -------------------------------------------------------------
-
-        if (
-            not is_crypto_target
-            and not market_is_tradeable(
-                is_crypto=False
-            )
-        ):
-
-            continue
-
-        # -------------------------------------------------------------
-        # Active trade limit
-        # -------------------------------------------------------------
-
-        active_symbols = (
-            get_open_position_symbols()
-            |
-            get_pending_order_symbols()
-        )
-
-        if (
-            len(active_symbols)
-            >= MAX_TOTAL_ACTIVE_TRADES
-        ):
-
-            logger.info(
-                "Active trade capacity "
-                "reached during scan."
+            # Re-fetch state because an earlier symbol may
+            # have created a new position/order.
+            positions = get_open_positions()
+            orders = get_open_orders()
+            pending = get_pending_symbols(
+                orders
             )
 
-            break
-
-        # -------------------------------------------------------------
-        # Symbol availability
-        # -------------------------------------------------------------
-
-        held_symbols = (
-            get_open_position_symbols()
-        )
-
-        pending_symbols = (
-            get_pending_order_symbols()
-        )
-
-        if not symbol_available_for_entry(
-            ticker,
-            held_symbols,
-            pending_symbols,
-        ):
-
-            continue
-
-        # -------------------------------------------------------------
-        # 1-minute data
-        # -------------------------------------------------------------
-
-        df_1m = fetch_1m_bars(
-            ticker,
-            limit=120,
-        )
-
-        if (
-            df_1m is None
-            or len(df_1m) < 30
-        ):
-
-            logger.info(
-                f"[{ticker}] Skipped: "
-                "insufficient 1M data."
+            active_count = (
+                len(positions)
+                + len(pending)
             )
 
-            continue
+            if (
+                active_count
+                >= MAX_TOTAL_ACTIVE_TRADES
+            ):
+                break
 
-        # -------------------------------------------------------------
-        # Volatility / RVOL hard gate
-        # -------------------------------------------------------------
+            if not symbol_available(
+                symbol,
+                positions,
+                pending,
+            ):
+                continue
 
-        if not passes_volatility_filter(
-            df_1m
-        ):
+            if "/" in symbol:
 
-            logger.info(
-                f"[{ticker}] Skipped: "
-                "fails volatility/RVOL hurdle."
+                if not ENABLE_CRYPTO_TRADING:
+                    logger.debug(
+                        "[%s] Crypto execution disabled.",
+                        symbol,
+                    )
+                    continue
+
+            # ----------------------------------------------------------
+            # Data
+            # ----------------------------------------------------------
+
+            df_1m = fetch_1m_bars(
+                symbol,
+                limit=180,
             )
 
-            continue
+            if df_1m is None:
+                logger.info(
+                    "[%s] rejected: no 1m data",
+                    symbol,
+                )
+                continue
 
-        # -------------------------------------------------------------
-        # IMPORTANT:
-        #
-        # Use the actual asset's 4H trend.
-        #
-        # Stocks -> ticker
-        # Crypto -> ticker converted for Yahoo
-        # -------------------------------------------------------------
-
-        trend_symbol = ticker
-
-        if is_crypto_target:
-
-            trend_symbol = ticker.replace(
-                "/",
-                "-",
+            df_4h = fetch_4h_bars_cached(
+                symbol
             )
 
-        df_4h = (
-            fetch_4h_bars_cached(
-                trend_symbol
+            if df_4h is None:
+                logger.info(
+                    "[%s] rejected: no 4H data",
+                    symbol,
+                )
+                continue
+
+            # ----------------------------------------------------------
+            # Indicators
+            # ----------------------------------------------------------
+
+            indicators = analyze_indicators(
+                df_1m,
+                df_4h,
             )
-        )
 
-        # -------------------------------------------------------------
-        # Indicator analysis
-        # -------------------------------------------------------------
+            # ----------------------------------------------------------
+            # Data quality
+            # ----------------------------------------------------------
 
-        indicators = analyze_indicators(
-            df_1m,
-            df_4h,
-        )
+            quality_ok, quality_reason = (
+                passes_data_quality(
+                    df_1m,
+                    indicators,
+                )
+            )
 
-        # -------------------------------------------------------------
-        # Signal
-        # -------------------------------------------------------------
+            if not quality_ok:
 
-        valid, reasons = (
-            bullish_signal(
+                logger.info(
+                    "[%s] rejected: %s",
+                    symbol,
+                    quality_reason,
+                )
+
+                continue
+
+            # ----------------------------------------------------------
+            # Signal
+            # ----------------------------------------------------------
+
+            signal = evaluate_signal(
                 indicators
             )
-        )
-
-        logger.info(
-            f"[{ticker}] "
-            f"Price={indicators['latest_price']:.2f} | "
-            f"RSI={indicators['rsi']:.1f} | "
-            f"MACD={indicators['macd_diff']:.4f} | "
-            f"RVOL={indicators['rvol']:.2f} | "
-            f"Trend4H={indicators['trend_4h']} | "
-            f"Signal={valid}"
-        )
-
-        if not valid:
-            continue
-
-        # -------------------------------------------------------------
-        # Re-check availability immediately before order
-        # -------------------------------------------------------------
-
-        held_symbols = (
-            get_open_position_symbols()
-        )
-
-        pending_symbols = (
-            get_pending_order_symbols()
-        )
-
-        if not symbol_available_for_entry(
-            ticker,
-            held_symbols,
-            pending_symbols,
-        ):
 
             logger.info(
-                f"[{ticker}] No longer "
-                "available for entry."
+                "[%s] price=%.2f "
+                "RSI=%.1f "
+                "MACD=%.4f "
+                "RVOL=%.2f "
+                "ATR%%=%.2f "
+                "4H=%s "
+                "score=%s "
+                "valid=%s",
+                symbol,
+                indicators["price"],
+                indicators["rsi"],
+                indicators["macd_diff"],
+                indicators["rvol"],
+                indicators["atr_pct"],
+                indicators["trend_4h"],
+                signal.score,
+                signal.valid,
             )
 
-            continue
+            if not signal.valid:
 
-        # -------------------------------------------------------------
-        # Position sizing
-        # -------------------------------------------------------------
+                logger.debug(
+                    "[%s] rejected: %s",
+                    symbol,
+                    signal.rejection,
+                )
 
-        qty = calculate_position_size(
-            equity=equity,
-            price=indicators[
-                "latest_price"
-            ],
-            atr=indicators[
-                "atr_15m"
-            ],
-            symbol=ticker,
-        )
+                continue
 
-        if qty <= 0:
+            # ----------------------------------------------------------
+            # Final sizing
+            # ----------------------------------------------------------
 
-            logger.info(
-                f"[{ticker}] Position size "
-                "calculated as zero."
+            qty = calculate_position_size(
+                equity=equity,
+                buying_power=buying_power,
+                price=indicators["price"],
+                atr=indicators["atr"],
             )
 
-            continue
+            if qty <= 0:
 
-        # -------------------------------------------------------------
-        # Signal logging
-        # -------------------------------------------------------------
+                logger.info(
+                    "[%s] rejected: "
+                    "position size <= 0",
+                    symbol,
+                )
 
-        log_decision(
-            f"SIGNAL VALID | "
-            f"{ticker} | "
-            + " | ".join(reasons)
-        )
+                continue
 
-        # -------------------------------------------------------------
-        # Submit order
-        # -------------------------------------------------------------
+            # ----------------------------------------------------------
+            # Final state check
+            # ----------------------------------------------------------
 
-        response = (
-            place_long_bracket_order(
-                symbol=ticker,
+            positions = get_open_positions()
+            orders = get_open_orders()
+            pending = get_pending_symbols(
+                orders
+            )
+
+            if not symbol_available(
+                symbol,
+                positions,
+                pending,
+            ):
+                continue
+
+            # ----------------------------------------------------------
+            # Execute
+            # ----------------------------------------------------------
+
+            if "/" in symbol:
+                # Explicitly disabled above.
+                continue
+
+            response = place_stock_bracket(
+                symbol=symbol,
                 qty=qty,
-                latest_price=indicators[
-                    "latest_price"
-                ],
-                atr=indicators[
-                    "atr_15m"
-                ],
+                price=indicators["price"],
+                atr=indicators["atr"],
+                score=signal.score,
+                reasons=signal.reasons,
             )
-        )
 
-        if response is not None:
+            if response is not None:
+                logger.info(
+                    "[%s] order accepted by broker.",
+                    symbol,
+                )
 
-            time.sleep(2)
+                # Prevent immediately submitting another
+                # order in the same cycle.
+                time.sleep(2)
+
+        except Exception as exc:
+
+            logger.exception(
+                "[%s] scan error: %s",
+                symbol,
+                exc,
+            )
 
 
-# =====================================================================
-# 20. MAIN
-# =====================================================================
+# ============================================================================
+# 18. MAIN
+# ============================================================================
 
-def main():
+def main() -> None:
 
     init_db()
 
     logger.info(
-        "Bull. Bear and Broke - "
-        "Trading Engine Online (v12 Balanced)"
+        "=========================================="
     )
 
     logger.info(
-        f"Paper trading: {PAPER_TRADING}"
+        "Bull. Bear and Broke v12 ONLINE"
+    )
+
+    logger.info(
+        "Paper trading: %s",
+        PAPER_TRADING,
+    )
+
+    logger.info(
+        "Risk/trade: %.2f%%",
+        RISK_PER_TRADE_PCT * 100,
+    )
+
+    logger.info(
+        "Minimum signal score: %s",
+        MIN_SIGNAL_SCORE,
+    )
+
+    logger.info(
+        "Crypto trading: %s",
+        ENABLE_CRYPTO_TRADING,
+    )
+
+    logger.info(
+        "=========================================="
     )
 
     while True:
 
         try:
-
             run_cycle()
 
         except KeyboardInterrupt:
 
             logger.info(
-                "Trading engine stopped by user."
+                "Trading engine stopped."
             )
-
             break
 
-        except Exception as e:
+        except Exception as exc:
 
             logger.exception(
-                "Critical error in "
-                f"main trading loop: {e}"
+                "Fatal cycle error: %s",
+                exc,
             )
 
         logger.info(
-            "Sleeping for 180 seconds "
-            "(3 minutes) before next cycle..."
+            "Sleeping %s seconds...",
+            CYCLE_SECONDS,
         )
 
-        time.sleep(180)
+        time.sleep(CYCLE_SECONDS)
 
 
 if __name__ == "__main__":
