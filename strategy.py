@@ -2,22 +2,28 @@
 BULL. BEAR AND BROKE - V14 STRATEGY
 ===================================
 
-V14:
-    - Real 1M execution
-    - Real 15M confirmation
-    - Real 4H regime
-    - No fake 4H EMA from 1M data
-    - No lookahead from higher timeframes
-    - Long only
-    - Pullback + reclaim entry
-    - 4H trend + slope regime
-    - 15M MACD momentum
-    - 1M RSI confirmation
-    - ATR risk management
+V14 DATA / TIMEFRAME SAFE VERSION
+
+Architecture:
+    4H regime
+        ↓
+    15M momentum
+        ↓
+    1M pullback/reclaim
+        ↓
+    next 1M bar execution
+        ↓
+    ATR stop / target
 
 IMPORTANT:
-    Experimental strategy.
-    Historical performance is not a guarantee of future results.
+    Higher-timeframe candles are shifted so the signal only sees
+    COMPLETED 15M and 4H candles.
+
+    All timestamps are normalized to:
+        datetime64[ns, UTC]
+
+    This prevents pandas merge_asof failures caused by Yahoo returning
+    different datetime resolutions such as datetime64[s] and datetime64[us].
 """
 
 from __future__ import annotations
@@ -42,23 +48,20 @@ MACD_SIGNAL = 9
 
 EMA_4H_PERIOD = 20
 
-EMA_FAST_1M = 9
-EMA_SLOW_1M = 21
-
+# Risk / reward
 ATR_STOP_MULT = 1.25
 ATR_TARGET_MULT = 2.00
 
+# Momentum
 RSI_MIN = 52.0
 RSI_MAX = 72.0
 
-MAX_CANDLE_ATR = 3.0
+# 1M execution quality
+EMA_FAST_1M = 9
+EMA_SLOW_1M = 21
 
-# Pullback/reclaim parameters.
-PULLBACK_LOOKBACK = 5
-RECLAIM_LOOKBACK = 3
-
-# Do not enter when price is excessively extended from 1M EMA21.
-MAX_EXTENSION_ATR = 1.75
+# Pullback/reclaim
+MAX_DISTANCE_FROM_EMA_ATR = 1.50
 
 
 # ============================================================================
@@ -72,7 +75,105 @@ class Signal:
 
 
 # ============================================================================
-# HELPERS
+# TIME INDEX NORMALIZATION
+# ============================================================================
+
+def normalize_index(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Normalize every dataframe index to exactly:
+
+        datetime64[ns, UTC]
+
+    Yahoo Finance can return different datetime resolutions depending
+    on interval/source. pandas merge_asof requires compatible dtypes.
+    """
+
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    out = df.copy()
+
+    # Convert index safely.
+    index = pd.to_datetime(
+        out.index,
+        errors="coerce",
+        utc=True,
+    )
+
+    valid = ~index.isna()
+
+    out = out.loc[valid].copy()
+
+    out.index = index[valid]
+
+    # Force nanosecond resolution.
+    out.index = pd.DatetimeIndex(
+        out.index
+    ).as_unit("ns")
+
+    # Sort.
+    out = out.sort_index()
+
+    # Remove duplicate timestamps.
+    out = out[
+        ~out.index.duplicated(
+            keep="last"
+        )
+    ]
+
+    return out
+
+
+# ============================================================================
+# OHLCV CLEANUP
+# ============================================================================
+
+def clean_ohlcv(
+    df: pd.DataFrame,
+) -> pd.DataFrame:
+
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    out = normalize_index(df)
+
+    required = [
+        "Open",
+        "High",
+        "Low",
+        "Close",
+        "Volume",
+    ]
+
+    if not all(
+        column in out.columns
+        for column in required
+    ):
+        return pd.DataFrame()
+
+    out = out[required].copy()
+
+    for column in required:
+
+        out[column] = pd.to_numeric(
+            out[column],
+            errors="coerce",
+        )
+
+    out = out.dropna(
+        subset=[
+            "Open",
+            "High",
+            "Low",
+            "Close",
+        ]
+    )
+
+    return out
+
+
+# ============================================================================
+# EMA
 # ============================================================================
 
 def _ema(
@@ -87,6 +188,10 @@ def _ema(
     ).mean()
 
 
+# ============================================================================
+# RSI
+# ============================================================================
+
 def _rsi(
     close: pd.Series,
     period: int = RSI_PERIOD,
@@ -94,8 +199,13 @@ def _rsi(
 
     delta = close.diff()
 
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
+    gain = delta.clip(
+        lower=0
+    )
+
+    loss = -delta.clip(
+        upper=0
+    )
 
     avg_gain = gain.ewm(
         alpha=1 / period,
@@ -111,13 +221,20 @@ def _rsi(
 
     rs = (
         avg_gain
-        / avg_loss.replace(0, np.nan)
+        / avg_loss.replace(
+            0,
+            np.nan,
+        )
     )
 
     return 100 - (
         100 / (1 + rs)
     )
 
+
+# ============================================================================
+# ATR
+# ============================================================================
 
 def _atr(
     df: pd.DataFrame,
@@ -149,14 +266,17 @@ def _atr(
 
 
 # ============================================================================
-# 1M
+# 1M INDICATORS
 # ============================================================================
 
 def calculate_1m_indicators(
     df: pd.DataFrame,
 ) -> pd.DataFrame:
 
-    out = df.copy()
+    out = clean_ohlcv(df)
+
+    if out.empty:
+        return out
 
     out["ATR_1M"] = _atr(
         out,
@@ -178,43 +298,21 @@ def calculate_1m_indicators(
         EMA_SLOW_1M,
     )
 
-    # Previous-bar values used by the signal.
-    out["PREV_CLOSE_1M"] = (
-        out["Close"].shift(1)
-    )
-
-    out["PREV_EMA9_1M"] = (
-        out["EMA9_1M"].shift(1)
-    )
-
-    out["PREV_EMA21_1M"] = (
-        out["EMA21_1M"].shift(1)
-    )
-
-    out["PREV_RSI_1M"] = (
-        out["RSI_1M"].shift(1)
-    )
-
-    # Recent high excluding current candle.
-    out["PREV_5_HIGH"] = (
-        out["High"]
-        .shift(1)
-        .rolling(5)
-        .max()
-    )
-
     return out
 
 
 # ============================================================================
-# 15M
+# 15M INDICATORS
 # ============================================================================
 
 def calculate_15m_indicators(
     df: pd.DataFrame,
 ) -> pd.DataFrame:
 
-    out = df.copy()
+    out = clean_ohlcv(df)
+
+    if out.empty:
+        return out
 
     fast = _ema(
         out["Close"],
@@ -234,35 +332,32 @@ def calculate_15m_indicators(
     )
 
     out["MACD_15M"] = macd
+
     out["MACD_SIGNAL_15M"] = signal
+
     out["MACD_DIFF_15M"] = (
         macd - signal
-    )
-
-    out["PREV_MACD_DIFF_15M"] = (
-        out["MACD_DIFF_15M"].shift(1)
     )
 
     return out
 
 
 # ============================================================================
-# 4H
+# 4H INDICATORS
 # ============================================================================
 
 def calculate_4h_indicators(
     df: pd.DataFrame,
 ) -> pd.DataFrame:
 
-    out = df.copy()
+    out = clean_ohlcv(df)
+
+    if out.empty:
+        return out
 
     out["EMA20_4H"] = _ema(
         out["Close"],
         EMA_4H_PERIOD,
-    )
-
-    out["PREV_EMA20_4H"] = (
-        out["EMA20_4H"].shift(1)
     )
 
     return out
@@ -277,6 +372,17 @@ def align_timeframes(
     df_15m: pd.DataFrame,
     df_4h: pd.DataFrame,
 ) -> pd.DataFrame:
+    """
+    Align real 1M, 15M and 4H data.
+
+    IMPORTANT:
+
+    The higher-timeframe series are shifted by one candle BEFORE
+    merge_asof().
+
+    Therefore a 1M candle can only see the previous completed
+    15M and 4H candles.
+    """
 
     one = calculate_1m_indicators(
         df_1m
@@ -290,20 +396,31 @@ def align_timeframes(
         df_4h
     )
 
+    if one.empty:
+        raise ValueError(
+            "1M dataframe is empty."
+        )
+
+    if fifteen.empty:
+        raise ValueError(
+            "15M dataframe is empty."
+        )
+
+    if four.empty:
+        raise ValueError(
+            "4H dataframe is empty."
+        )
+
     # ------------------------------------------------------------------------
-    # IMPORTANT:
-    #
-    # Yahoo timestamps normally identify the START of the candle.
-    #
-    # A 15M candle beginning at 10:00 is not completed until 10:15.
-    # A 4H candle beginning at 09:30 is not completed until 13:30.
-    #
-    # Move the higher timeframe timestamp forward by its duration.
-    #
-    # Then merge_asof backward.
-    #
-    # This is much safer than simply shift(1), which can introduce
-    # unnecessary delays and confusing alignment.
+    # Ensure exact timestamp dtype one more time.
+    # ------------------------------------------------------------------------
+
+    one = normalize_index(one)
+    fifteen = normalize_index(fifteen)
+    four = normalize_index(four)
+
+    # ------------------------------------------------------------------------
+    # Keep only required higher-timeframe columns.
     # ------------------------------------------------------------------------
 
     fifteen = fifteen[
@@ -311,48 +428,124 @@ def align_timeframes(
             "MACD_15M",
             "MACD_SIGNAL_15M",
             "MACD_DIFF_15M",
-            "PREV_MACD_DIFF_15M",
         ]
     ].copy()
 
     four = four[
         [
             "EMA20_4H",
-            "PREV_EMA20_4H",
         ]
     ].copy()
 
-    fifteen.index = (
+    # ------------------------------------------------------------------------
+    # CRITICAL:
+    #
+    # Shift higher timeframe indicators one full candle.
+    #
+    # Example:
+    # 10:15 1M bar cannot use the 10:00-10:15 candle while that candle
+    # is still forming.
+    #
+    # After shift, the value available at the next timeframe timestamp
+    # represents the completed prior candle.
+    # ------------------------------------------------------------------------
+
+    fifteen = fifteen.shift(1)
+
+    four = four.shift(1)
+
+    # ------------------------------------------------------------------------
+    # Remove rows where indicators aren't ready.
+    # ------------------------------------------------------------------------
+
+    fifteen = fifteen.dropna(
+        subset=[
+            "MACD_DIFF_15M",
+        ]
+    )
+
+    four = four.dropna(
+        subset=[
+            "EMA20_4H",
+        ]
+    )
+
+    if fifteen.empty:
+        raise ValueError(
+            "15M indicators contain no valid completed candles."
+        )
+
+    if four.empty:
+        raise ValueError(
+            "4H EMA20 contains no valid completed candles."
+        )
+
+    # ------------------------------------------------------------------------
+    # Verify timestamp dtypes.
+    # ------------------------------------------------------------------------
+
+    if not isinstance(
+        one.index,
+        pd.DatetimeIndex,
+    ):
+        raise TypeError(
+            "1M index is not DatetimeIndex."
+        )
+
+    if not isinstance(
+        fifteen.index,
+        pd.DatetimeIndex,
+    ):
+        raise TypeError(
+            "15M index is not DatetimeIndex."
+        )
+
+    if not isinstance(
+        four.index,
+        pd.DatetimeIndex,
+    ):
+        raise TypeError(
+            "4H index is not DatetimeIndex."
+        )
+
+    # ------------------------------------------------------------------------
+    # Final hard normalization.
+    # ------------------------------------------------------------------------
+
+    one.index = pd.DatetimeIndex(
+        one.index
+    ).as_unit("ns")
+
+    fifteen.index = pd.DatetimeIndex(
         fifteen.index
-        + pd.Timedelta(minutes=15)
-    )
+    ).as_unit("ns")
 
-    four.index = (
+    four.index = pd.DatetimeIndex(
         four.index
-        + pd.Timedelta(hours=4)
-    )
+    ).as_unit("ns")
 
-    one = one.sort_index()
-
-    fifteen = fifteen.sort_index()
-    four = four.sort_index()
+    # ------------------------------------------------------------------------
+    # merge_asof 1M <- 15M
+    # ------------------------------------------------------------------------
 
     one = pd.merge_asof(
-        one,
-        fifteen,
+        one.sort_index(),
+        fifteen.sort_index(),
         left_index=True,
         right_index=True,
         direction="backward",
-        allow_exact_matches=True,
     )
 
+    # ------------------------------------------------------------------------
+    # merge_asof result <- 4H
+    # ------------------------------------------------------------------------
+
     one = pd.merge_asof(
-        one,
-        four,
+        one.sort_index(),
+        four.sort_index(),
         left_index=True,
         right_index=True,
         direction="backward",
-        allow_exact_matches=True,
     )
 
     return one
@@ -366,9 +559,13 @@ def calculate_indicators(
     df: pd.DataFrame,
 ) -> pd.DataFrame:
 
-    return calculate_1m_indicators(
-        df
-    )
+    """
+    Older code can still call this.
+
+    For V14 multi-timeframe backtesting, use align_timeframes().
+    """
+
+    return calculate_1m_indicators(df)
 
 
 # ============================================================================
@@ -385,17 +582,10 @@ def evaluate_signal(
         "Low",
         "ATR_1M",
         "RSI_1M",
+        "MACD_DIFF_15M",
+        "EMA20_4H",
         "EMA9_1M",
         "EMA21_1M",
-        "PREV_CLOSE_1M",
-        "PREV_EMA9_1M",
-        "PREV_EMA21_1M",
-        "PREV_RSI_1M",
-        "PREV_5_HIGH",
-        "MACD_DIFF_15M",
-        "PREV_MACD_DIFF_15M",
-        "EMA20_4H",
-        "PREV_EMA20_4H",
     ]
 
     for column in required:
@@ -412,9 +602,17 @@ def evaluate_signal(
                 f"missing_{column}",
             )
 
-    close = float(row["Close"])
-    high = float(row["High"])
-    low = float(row["Low"])
+    close = float(
+        row["Close"]
+    )
+
+    high = float(
+        row["High"]
+    )
+
+    low = float(
+        row["Low"]
+    )
 
     atr = float(
         row["ATR_1M"]
@@ -424,48 +622,20 @@ def evaluate_signal(
         row["RSI_1M"]
     )
 
-    ema9 = float(
-        row["EMA9_1M"]
-    )
-
-    ema21 = float(
-        row["EMA21_1M"]
-    )
-
-    prev_close = float(
-        row["PREV_CLOSE_1M"]
-    )
-
-    prev_ema9 = float(
-        row["PREV_EMA9_1M"]
-    )
-
-    prev_ema21 = float(
-        row["PREV_EMA21_1M"]
-    )
-
-    prev_rsi = float(
-        row["PREV_RSI_1M"]
-    )
-
-    previous_high = float(
-        row["PREV_5_HIGH"]
-    )
-
     macd_diff = float(
         row["MACD_DIFF_15M"]
-    )
-
-    previous_macd = float(
-        row["PREV_MACD_DIFF_15M"]
     )
 
     ema20_4h = float(
         row["EMA20_4H"]
     )
 
-    previous_ema20_4h = float(
-        row["PREV_EMA20_4H"]
+    ema9 = float(
+        row["EMA9_1M"]
+    )
+
+    ema21 = float(
+        row["EMA21_1M"]
     )
 
     # ------------------------------------------------------------------------
@@ -489,15 +659,10 @@ def evaluate_signal(
     # ------------------------------------------------------------------------
 
     if close <= ema20_4h:
+
         return Signal(
             False,
             "below_4h_ema",
-        )
-
-    if ema20_4h <= previous_ema20_4h:
-        return Signal(
-            False,
-            "4h_ema_not_rising",
         )
 
     # ------------------------------------------------------------------------
@@ -505,16 +670,10 @@ def evaluate_signal(
     # ------------------------------------------------------------------------
 
     if macd_diff <= 0:
+
         return Signal(
             False,
             "negative_15m_macd",
-        )
-
-    # Prefer improving momentum.
-    if macd_diff < previous_macd:
-        return Signal(
-            False,
-            "15m_macd_fading",
         )
 
     # ------------------------------------------------------------------------
@@ -522,101 +681,73 @@ def evaluate_signal(
     # ------------------------------------------------------------------------
 
     if not (
-        RSI_MIN <= rsi <= RSI_MAX
+        RSI_MIN
+        <= rsi
+        <= RSI_MAX
     ):
+
         return Signal(
             False,
             "rsi_filter",
         )
 
-    # RSI should not be collapsing.
-    if rsi < prev_rsi - 8:
+    # ------------------------------------------------------------------------
+    # 1M EMA STRUCTURE
+    #
+    # Price must reclaim the fast EMA while fast EMA is above slow EMA.
+    # ------------------------------------------------------------------------
+
+    if not (
+        close > ema9
+        and ema9 > ema21
+    ):
+
         return Signal(
             False,
-            "rsi_falling",
+            "no_1m_reclaim",
         )
 
     # ------------------------------------------------------------------------
-    # CANDLE SIZE
+    # Don't buy extremely stretched price.
     # ------------------------------------------------------------------------
 
-    candle_range = high - low
+    distance_from_ema = (
+        close - ema21
+    ) / atr
 
-    if candle_range > (
-        MAX_CANDLE_ATR * atr
+    if (
+        distance_from_ema
+        > MAX_DISTANCE_FROM_EMA_ATR
     ):
+
+        return Signal(
+            False,
+            "overextended",
+        )
+
+    # ------------------------------------------------------------------------
+    # Don't allow absurd single-bar ranges.
+    # ------------------------------------------------------------------------
+
+    candle_range = (
+        high - low
+    )
+
+    if candle_range > 3.0 * atr:
+
         return Signal(
             False,
             "oversized_candle",
         )
 
-    # ------------------------------------------------------------------------
-    # AVOID EXTREME EXTENSION
-    # ------------------------------------------------------------------------
-
-    extension = (
-        close - ema21
-    ) / atr
-
-    if extension > MAX_EXTENSION_ATR:
-        return Signal(
-            False,
-            "too_extended",
-        )
-
-    # ------------------------------------------------------------------------
-    # PULLBACK / RECLAIM
-    #
-    # We want the previous candle to have been weaker,
-    # while the current completed candle reclaims EMA9.
-    # ------------------------------------------------------------------------
-
-    previous_below_or_touch = (
-        prev_close <= prev_ema9
-        or prev_close <= prev_ema21
-    )
-
-    reclaim_now = (
-        close > ema9
-        and close > prev_close
-    )
-
-    if not previous_below_or_touch:
-        return Signal(
-            False,
-            "no_pullback",
-        )
-
-    if not reclaim_now:
-        return Signal(
-            False,
-            "no_reclaim",
-        )
-
-    # ------------------------------------------------------------------------
-    # MICRO BREAKOUT
-    #
-    # Current close must reclaim recent structure.
-    # ------------------------------------------------------------------------
-
-    if close < previous_high:
-        return Signal(
-            False,
-            "no_micro_breakout",
-        )
-
-    # ------------------------------------------------------------------------
-    # FINAL SIGNAL
-    # ------------------------------------------------------------------------
-
     return Signal(
         True,
-        "V14_LONG_PULLBACK_RECLAIM",
+        "V14_LONG",
     )
 
 
 # ============================================================================
-# EXITS
+# EXIT PRICES
 # ============================================================================
 
 def calculate_exit_prices(
@@ -630,6 +761,7 @@ def calculate_exit_prices(
         or entry_price <= 0
         or atr <= 0
     ):
+
         raise ValueError(
             "Invalid entry price or ATR."
         )
@@ -645,6 +777,7 @@ def calculate_exit_prices(
     )
 
     if stop <= 0:
+
         raise ValueError(
             "Calculated stop is not positive."
         )
