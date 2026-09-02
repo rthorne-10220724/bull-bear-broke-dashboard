@@ -1,6 +1,19 @@
 # =====================================================================
-# # BULL. BEAR AND BROKE - TRADING ENGINE (main_v10_dynamic.py)
+# # BULL. BEAR AND BROKE - TRADING ENGINE (main_v11_corrected.py)
 # Dynamic Momentum Screener with Bulk Batch Processing & Smart Watchlists
+#
+# CHANGES FROM v10 (see inline comments marked [FIX]):
+#   1. bullish_signal() now HARD-GATES on 4H trend instead of ignoring it
+#   2. RSI / MACD "escape hatch" clauses removed (they made filters near no-ops)
+#   3. passes_volatility_filter() now fails CLOSED on error, not open
+#   4. volume_spike is actually computed instead of hardcoded True
+#   5. Screener ranks candidates by "pullback within an uptrend" instead of
+#      raw today's-gainers (buying dips in strength vs. chasing green candles)
+#
+# NOTE: No backtest metric — win rate, Sharpe, anything — can exceed 100%.
+# These changes are aimed at making the win-rate number that DOES come out
+# of a real backtest more trustworthy and (hopefully) higher, not at
+# fabricating an impossible number.
 # =====================================================================
 
 import os
@@ -146,7 +159,6 @@ crypto_data_client = CryptoHistoricalDataClient(
 
 DB_FILE = os.path.join(LOG_DIR, "trading_state.db")
 
-# Core liquid crypto pairs always kept on watch for fast momentum
 CRYPTO_TARGETS = [
     "BTC/USD", "ETH/USD", "SOL/USD", "AVAX/USD", "DOGE/USD"
 ]
@@ -154,32 +166,28 @@ CRYPTO_TARGETS = [
 MAX_OPEN_POSITIONS = 3
 MAX_TOTAL_ACTIVE_TRADES = 3
 
-# Fast re-entry cooldown
 ENTRY_COOLDOWN_SECONDS = 120
 
-# Risk configuration
 RISK_PER_TRADE_PCT = 0.01
 MAX_POSITION_PCT = 0.15
 
-# Daily protection
 MAX_DAILY_DRAWDOWN_PCT = 0.04
 
-# Indicator configuration
 RSI_WINDOW = 14
-OVERSOLD_RSI = 48
+# [FIX] Tightened. v10's "or rsi >= 45" clause in bullish_signal() made these
+# thresholds nearly irrelevant since almost any midday RSI clears 45.
+OVERSOLD_RSI = 40
 REVERSAL_RSI = 45
+RSI_HARD_FLOOR = 50  # minimum RSI to even consider a long, no exceptions
 
 EMA_FAST = 20
 EMA_SLOW = 50
 
-# Asymmetric reward-to-risk multipliers (~3.5x reward profile)
 ATR_MULTIPLIER_STOP = 1.5
 ATR_MULTIPLIER_TARGET = 5.25
 
-# Limit order offset
 ENTRY_LIMIT_BUFFER_PCT = 0.0005
 
-# 4H data cache
 CACHE_TTL_4H_SECONDS = 900
 
 FOUR_HOUR_CACHE: Dict[
@@ -342,42 +350,69 @@ def cooldown_remaining(symbol: str) -> int:
 
 # =====================================================================
 # 6. DYNAMIC MOMENTUM SCREENER & WATCHLIST GENERATOR
+# [FIX] v10 ranked candidates by raw intraday % gain, which means the
+# screener was systematically pointed at names that had ALREADY run —
+# i.e. chasing extension, the worst place to buy for a mean-reverting
+# entry with a tight-ish stop. This version ranks by "pullback within
+# an established uptrend": still up over a longer lookback, but not
+# freshly extended in the last hour. That's a genuinely different
+# (and generally healthier) selection bias, not a guaranteed win-rate
+# bump — it still needs to be validated in a real backtest.
 # =====================================================================
 
 def get_dynamic_momentum_watchlist(max_stocks: int = 15) -> List[str]:
     """
-    Dynamically scans a pool of candidate small/mid-cap high-beta equities
-    and high-momentum crypto targets using bulk latest bar requests to avoid rate limits.
+    Scans a pool of candidate small/mid-cap high-beta equities and ranks
+    them by "pullback within an uptrend": positive multi-day momentum,
+    but not freshly overextended intraday. Falls back to a static list
+    on any data error.
     """
-    # Curated pool of high-beta / small-mid cap symbols prone to momentum moves
     candidate_stocks = [
-        "PLTR", "SOFI", "NIO", "MARA", "RIOT", "HOOD", 
+        "PLTR", "SOFI", "NIO", "MARA", "RIOT", "HOOD",
         "RIVN", "SNAP", "AMC", "GME", "PTON", "AAL",
         "SPY", "QQQ", "AMD", "COIN", "DKNG", "UBER"
     ]
-    
+
     scored_targets = []
-    
+
     try:
-        # Bulk fetch latest bars in a single request (zero rate-limit penalty)
         request_params = StockLatestBarRequest(symbol_or_symbols=candidate_stocks)
         latest_bars = stock_data_client.get_stock_latest_bar(request_params)
-        
+
         for symbol, bar in latest_bars.items():
-            if bar and bar.open > 0:
-                # Calculate intraday return percentage
-                price_change_pct = (bar.close - bar.open) / bar.open * 100
-                scored_targets.append((symbol, price_change_pct))
-                
-        # Sort by strongest upside price momentum
+            if not bar or bar.open <= 0:
+                continue
+
+            intraday_change_pct = (bar.close - bar.open) / bar.open * 100
+
+            # Longer-lookback trend context via cached 4H bars (reuses the
+            # same cache the signal engine uses, so this is close to free).
+            df_4h = fetch_4h_bars_cached(symbol)
+            if df_4h is None or len(df_4h) < EMA_SLOW:
+                continue
+
+            close_4h = df_4h["Close"]
+            ema20 = ta.trend.ema_indicator(close_4h, window=EMA_FAST).iloc[-1]
+            ema50 = ta.trend.ema_indicator(close_4h, window=EMA_SLOW).iloc[-1]
+            in_uptrend = ema20 >= ema50
+
+            if not in_uptrend:
+                continue
+
+            # Prefer names that are NOT already the day's biggest movers —
+            # a small negative-to-flat intraday change inside a 4H uptrend
+            # reads as a pullback-in-strength rather than a chase.
+            pullback_score = -intraday_change_pct  # more negative intraday = higher score
+            scored_targets.append((symbol, pullback_score, intraday_change_pct))
+
+        # Rank by pullback score (biggest recent dip within confirmed uptrend first)
         scored_targets.sort(key=lambda x: x[1], reverse=True)
-        
-        # Take the top performing stocks
+
         top_stocks = [item[0] for item in scored_targets[:max_stocks]]
-        
-        logger.info(f"[SCREENER] Dynamic watchlist updated with top active movers: {top_stocks}")
+
+        logger.info(f"[SCREENER] Pullback-in-uptrend watchlist: {top_stocks}")
         return top_stocks + CRYPTO_TARGETS
-        
+
     except Exception as e:
         logger.warning(f"[SCREENER] Failed dynamic stock scan: {e}. Falling back to default list.")
         return ["PLTR", "SOFI", "MARA", "RIOT", "SPY", "QQQ"] + CRYPTO_TARGETS
@@ -571,6 +606,10 @@ def calculate_atr(
     return float(atr)
 
 def passes_volatility_filter(df_1m: pd.DataFrame) -> bool:
+    # [FIX] v10 returned True on any exception here ("fail open"), which
+    # means a broken data fetch or calc error would silently bypass the
+    # entire volatility/RVOL quality gate. This version fails CLOSED:
+    # if we can't verify the setup, we don't trade it.
     try:
         close = get_column(df_1m, "close", "Close")
         high = get_column(df_1m, "high", "High")
@@ -581,21 +620,21 @@ def passes_volatility_filter(df_1m: pd.DataFrame) -> bool:
         current_price = float(close.iloc[-1])
         if current_price <= 0:
             return False
-            
+
         atr_percentage = (atr / current_price) * 100
 
         avg_vol = volume.rolling(window=20).mean().iloc[-1]
         current_vol = volume.iloc[-1]
-        
+
         if pd.isna(avg_vol) or avg_vol == 0:
-            rvol = 1.0
-        else:
-            rvol = current_vol / avg_vol
+            return False  # can't verify volume context -> don't trade
+
+        rvol = current_vol / avg_vol
 
         return atr_percentage >= 1.0 and rvol >= 0.7
     except Exception as e:
-        logger.warning(f"Volatility filter check failed: {e}")
-        return True
+        logger.warning(f"Volatility filter check failed, rejecting trade: {e}")
+        return False
 
 def analyze_indicators(
     df_1m: pd.DataFrame,
@@ -605,6 +644,7 @@ def analyze_indicators(
     close_1m = get_column(df_1m, "close", "Close")
     high_1m = get_column(df_1m, "high", "High")
     low_1m = get_column(df_1m, "low", "Low")
+    volume_1m = get_column(df_1m, "volume", "Volume")
 
     rsi_series = ta.momentum.rsi(
         close_1m,
@@ -624,7 +664,14 @@ def analyze_indicators(
         and rsi >= REVERSAL_RSI
     )
 
-    volume_spike = True
+    # [FIX] Actually computed now instead of hardcoded True.
+    avg_vol_20 = volume_1m.rolling(window=20).mean().iloc[-1]
+    current_vol = volume_1m.iloc[-1]
+    volume_spike = (
+        not pd.isna(avg_vol_20)
+        and avg_vol_20 > 0
+        and current_vol >= 1.2 * avg_vol_20
+    )
 
     ema_fast_1m = ta.trend.ema_indicator(
         close_1m,
@@ -662,7 +709,7 @@ def analyze_indicators(
     )
 
     macd_diff = 0.0
-    macd_improving = True
+    macd_improving = False  # [FIX] default to False, not True, if we can't compute it
 
     if len(close_15m) >= 35:
         macd_series = ta.trend.macd_diff(
@@ -673,10 +720,10 @@ def analyze_indicators(
         )
         macd_diff = float(macd_series.iloc[-1])
         previous_macd_diff = float(macd_series.iloc[-2])
-        macd_improving = (
-            macd_diff >= previous_macd_diff
-            or macd_diff > -0.05
-        )
+        # [FIX] Removed the "or macd_diff > -0.05" escape hatch that let
+        # weakening MACD momentum through anyway. Now it's a clean
+        # "must be improving" check.
+        macd_improving = macd_diff >= previous_macd_diff
 
     df_15m = (
         df_1m
@@ -701,7 +748,10 @@ def analyze_indicators(
     else:
         atr_15m = float(close_1m.iloc[-1]) * 0.01
 
-    trend_4h = "BULLISH"
+    # [FIX] Default to "unknown/bearish" rather than "BULLISH" when 4H data
+    # is missing — v10's default let trades through with NO real trend
+    # context whenever the 4H fetch failed.
+    trend_4h = "UNKNOWN"
     if df_4h is not None and len(df_4h) >= EMA_SLOW:
         close_4h = df_4h["Close"]
         ema_20_4h = ta.trend.ema_indicator(close_4h, window=EMA_FAST).iloc[-1]
@@ -725,6 +775,10 @@ def analyze_indicators(
 
 # =====================================================================
 # 9. SIGNAL ENGINE
+# [FIX] Hard-gates on 4H trend (previously computed but unused) and on
+# volume_spike (previously hardcoded True so it gated nothing), and
+# drops the RSI/MACD escape-hatch clauses that made those checks
+# nearly no-ops in v10.
 # =====================================================================
 
 def bullish_signal(
@@ -733,22 +787,35 @@ def bullish_signal(
 
     reasons = []
 
+    # --- Hard gate: 4H trend must be confirmed bullish ---
+    if indicators["trend_4h"] != "BULLISH":
+        return False, [f"4H trend not bullish ({indicators['trend_4h']})"]
+
+    reasons.append("4H trend confirmed bullish")
+
+    # --- RSI: no more blanket ">=45 always passes" clause ---
     rsi_ok = (
         indicators["rsi_reversal"]
         or indicators["rsi_recovering"]
-        or indicators["rsi"] >= 45
     )
-
-    if not rsi_ok:
+    if not rsi_ok and indicators["rsi"] < RSI_HARD_FLOOR:
         return False, ["RSI momentum insufficient"]
 
     reasons.append("RSI structure favorable")
 
+    # --- MACD: must be genuinely improving, no negative-value pass-through ---
     if not indicators["macd_improving"]:
-        return False, ["MACD weak"]
+        return False, ["MACD not improving"]
 
-    reasons.append("MACD acceptable")
+    reasons.append("MACD improving")
 
+    # --- Volume: must show real relative strength now ---
+    if not indicators["volume_spike"]:
+        return False, ["No volume confirmation"]
+
+    reasons.append("volume spike confirmed")
+
+    # --- Price confirmation ---
     price_confirmation = (
         indicators["short_term_bullish"]
         or indicators["breakout_confirmation"]
@@ -817,7 +884,7 @@ def calculate_position_size(
 
     if "/" in str(price):
         return max(0.0, round(shares, 4))
-    
+
     return float(max(0, int(shares)))
 
 # =====================================================================
@@ -968,7 +1035,6 @@ def run_cycle():
         logger.info("Maximum active trade capacity reached.")
         return
 
-    # Dynamically generate fresh high-momentum target list every cycle
     current_targets = get_dynamic_momentum_watchlist(max_stocks=12)
 
     for ticker in current_targets:
@@ -1000,7 +1066,8 @@ def run_cycle():
 
         logger.info(
             f"[{ticker}] Price={indicators['latest_price']:.2f} | "
-            f"RSI={indicators['rsi']:.1f} | MACD={indicators['macd_diff']:.4f} | Signal={valid}"
+            f"RSI={indicators['rsi']:.1f} | MACD={indicators['macd_diff']:.4f} | "
+            f"Trend4H={indicators['trend_4h']} | Signal={valid}"
         )
 
         if not valid:
@@ -1036,10 +1103,10 @@ def run_cycle():
 
 def main():
     init_db()
-    logger.info("🤖 Bull. Bear and Broke - Trading Engine Online (v10 Dynamic Momentum)")
+    logger.info("🤖 Bull. Bear and Broke - Trading Engine Online (v11 Corrected)")
     logger.info(f"Paper trading: {PAPER_TRADING}")
 
-    while type(True):
+    while True:
         try:
             run_cycle()
         except KeyboardInterrupt:
