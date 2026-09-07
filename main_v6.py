@@ -1,8 +1,8 @@
 """
-BULL. BEAR AND BROKE - TRADING ENGINE v12
+BULL. BEAR AND BROKE - TRADING ENGINE v13
 ==========================================
 
-Hardened momentum / pullback trading engine.
+Market-wide opportunity discovery + hardened momentum / pullback trading engine.
 
 IMPORTANT:
 -----------
@@ -277,11 +277,34 @@ MARKET_CLOSE_BUFFER_SECONDS = 10 * 60
 # order-class capabilities.
 ENABLE_CRYPTO_TRADING = False
 
+# ---------------------------------------------------------------------------
+# Market-wide opportunity discovery
+# ---------------------------------------------------------------------------
+# Discovery only finds and ranks candidates. Existing V12 entry/risk rules
+# remain the final authority before any order can be submitted.
+ENABLE_MARKET_DISCOVERY = True
+DISCOVERY_CACHE_TTL_SECONDS = 900
+DISCOVERY_MAX_UNIVERSE = 2500
+DISCOVERY_BATCH_SIZE = 100
+DISCOVERY_LOOKBACK_DAYS = 60
+DISCOVERY_MIN_PRICE = 5.00
+DISCOVERY_MIN_AVG_DOLLAR_VOLUME = 5_000_000
+DISCOVERY_MIN_5D_RETURN = 0.00
+DISCOVERY_MIN_20D_RETURN = 0.00
+DISCOVERY_MIN_DAILY_RVOL = 1.00
+DISCOVERY_MAX_EXTENSION_ATR = 2.50
+DISCOVERY_TOP_N = 12
+
 
 FOUR_HOUR_CACHE: Dict[
     str,
     Tuple[pd.DataFrame, dt.datetime]
 ] = {}
+
+DISCOVERY_CACHE: Tuple[List[str], dt.datetime] = (
+    [],
+    dt.datetime.min.replace(tzinfo=dt.timezone.utc),
+)
 
 
 # ============================================================================
@@ -1339,110 +1362,288 @@ def market_is_tradeable() -> bool:
 
 
 # ============================================================================
-# 13. WATCHLIST
+# 13. MARKET-WIDE OPPORTUNITY DISCOVERY / WATCHLIST
 # ============================================================================
 
-def build_watchlist(
-    max_stocks: int = 12,
-) -> List[str]:
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        value = float(value)
+        return value if np.isfinite(value) else default
+    except (TypeError, ValueError):
+        return default
 
-    scored: List[Tuple[str, float]] = []
 
-    for symbol in STOCK_CANDIDATES:
+def get_discovery_universe() -> List[str]:
+    """Build a broad broker-tradable U.S. equity universe."""
+    try:
+        assets = trading_client.get_all_assets()
+        allowed_exchanges = {
+            "NYSE", "NASDAQ", "AMEX", "ARCA", "BATS",
+            "NYSEARCA", "NYSEAMERICAN",
+        }
+        symbols: List[str] = []
 
-        try:
-            df = fetch_4h_bars_cached(symbol)
+        for asset in assets:
+            symbol = str(getattr(asset, "symbol", "") or "").upper().strip()
+            status_obj = getattr(asset, "status", "")
+            asset_class_obj = getattr(asset, "asset_class", "")
+            exchange_obj = getattr(asset, "exchange", "")
+            status = str(getattr(status_obj, "value", status_obj) or "").lower()
+            asset_class = str(getattr(asset_class_obj, "value", asset_class_obj) or "").lower()
+            exchange = str(getattr(exchange_obj, "value", exchange_obj) or "").upper()
+            tradable = bool(getattr(asset, "tradable", False))
 
-            if df is None:
+            if not symbol or "/" in symbol or not tradable:
                 continue
-
-            close = df["Close"]
-
-            ema20 = ta.trend.ema_indicator(
-                close,
-                window=EMA_FAST_4H,
-            )
-
-            ema50 = ta.trend.ema_indicator(
-                close,
-                window=EMA_SLOW_4H,
-            )
-
-            if (
-                pd.isna(ema20.iloc[-1])
-                or pd.isna(ema50.iloc[-1])
-            ):
+            if status and status != "active":
                 continue
-
-            # Hard trend filter.
-            if ema20.iloc[-1] <= ema50.iloc[-1]:
+            if asset_class and asset_class not in {"us_equity", "us equity"}:
                 continue
-
-            atr = calculate_atr(df)
-
-            if atr <= 0:
+            if exchange and exchange not in allowed_exchanges:
                 continue
+            symbols.append(symbol)
 
-            price = float(close.iloc[-1])
+        # Preserve the original strategy universe as a fallback/priority set.
+        symbols = sorted(set(symbols).union(STOCK_CANDIDATES))
+        priority = [s for s in STOCK_CANDIDATES if s in symbols]
+        remainder = [s for s in symbols if s not in priority]
+        symbols = priority + remainder
 
-            # How far price is from EMA20 in ATR units.
-            #
-            # We prefer stocks that remain strong but aren't
-            # extremely extended.
-            extension = (
-                price - ema20.iloc[-1]
-            ) / atr
+        if len(symbols) > DISCOVERY_MAX_UNIVERSE:
+            symbols = symbols[:DISCOVERY_MAX_UNIVERSE]
 
-            if extension > 2.5:
-                continue
+        logger.info("[DISCOVERY] Universe ready: %s symbols", len(symbols))
+        return symbols
 
-            # Favor modest pullbacks / proximity to EMA20.
-            distance_score = -abs(extension)
+    except Exception as exc:
+        logger.error("[DISCOVERY] Failed to build universe: %s", exc)
+        return list(STOCK_CANDIDATES)
 
-            slope_bonus = (
-                1.0
-                if ema20.iloc[-1] > ema20.iloc[-4]
-                else 0.0
-            )
 
-            score = (
-                distance_score
-                + slope_bonus
-            )
+def fetch_daily_bars_batch(
+    symbols: List[str],
+    lookback_days: int = DISCOVERY_LOOKBACK_DAYS,
+) -> Dict[str, pd.DataFrame]:
+    """Fetch daily bars for many symbols in one Alpaca request."""
+    if not symbols:
+        return {}
 
-            scored.append(
-                (symbol, score)
-            )
+    end = dt.datetime.now(dt.timezone.utc)
+    start = end - dt.timedelta(days=lookback_days + 15)
 
-        except Exception as exc:
-            logger.debug(
-                "[SCREENER] %s failed: %s",
-                symbol,
-                exc,
-            )
+    try:
+        request = StockBarsRequest(
+            symbol_or_symbols=symbols,
+            timeframe=TimeFrame.Day,
+            start=start,
+            end=end,
+            feed=DataFeed.IEX,
+        )
+        response = stock_data_client.get_stock_bars(request)
+        df = response.df
+        if df is None or df.empty:
+            return {}
 
-    scored.sort(
-        key=lambda x: x[1],
-        reverse=True,
+        result: Dict[str, pd.DataFrame] = {}
+        if isinstance(df.index, pd.MultiIndex):
+            names = list(df.index.names)
+            symbol_level = names.index("symbol") if "symbol" in names else 0
+            for symbol, group in df.groupby(level=symbol_level):
+                group = group.droplevel(symbol_level)
+                normalized = normalize_ohlcv(group)
+                if normalized is not None and len(normalized) >= 20:
+                    result[str(symbol).upper()] = normalized.tail(lookback_days)
+        else:
+            normalized = normalize_ohlcv(df)
+            if normalized is not None:
+                result[symbols[0]] = normalized.tail(lookback_days)
+        return result
+
+    except Exception as exc:
+        logger.warning(
+            "[DISCOVERY] Daily batch failed (%s symbols): %s",
+            len(symbols), exc,
+        )
+        return {}
+
+
+def _discovery_score(
+    df: pd.DataFrame,
+    spy_5d_return: float,
+) -> Optional[Tuple[float, Dict[str, float]]]:
+    """Score strengthening, liquid momentum candidates from daily data."""
+    if len(df) < 50:
+        return None
+
+    close = pd.to_numeric(df["Close"], errors="coerce").dropna()
+    volume = pd.to_numeric(df["Volume"], errors="coerce").dropna()
+    if len(close) < 50 or len(volume) < 21:
+        return None
+
+    price = _safe_float(close.iloc[-1])
+    if price < DISCOVERY_MIN_PRICE:
+        return None
+
+    ema20 = ta.trend.ema_indicator(close, window=20)
+    ema50 = ta.trend.ema_indicator(close, window=50)
+    atr = calculate_atr(df, window=14)
+    if pd.isna(ema20.iloc[-1]) or pd.isna(ema50.iloc[-1]) or atr <= 0:
+        return None
+
+    avg_volume_20 = _safe_float(volume.tail(20).mean())
+    avg_dollar_volume = avg_volume_20 * price
+    if avg_dollar_volume < DISCOVERY_MIN_AVG_DOLLAR_VOLUME:
+        return None
+
+    ret_5d = _safe_float(close.iloc[-1] / close.iloc[-6] - 1.0)
+    ret_20d = _safe_float(close.iloc[-1] / close.iloc[-21] - 1.0)
+    if ret_5d < DISCOVERY_MIN_5D_RETURN or ret_20d < DISCOVERY_MIN_20D_RETURN:
+        return None
+
+    baseline_volume = _safe_float(volume.iloc[-21:-1].mean())
+    daily_rvol = _safe_float(volume.iloc[-1] / baseline_volume) if baseline_volume > 0 else 0.0
+    if daily_rvol < DISCOVERY_MIN_DAILY_RVOL:
+        return None
+
+    extension_atr = _safe_float((price - ema20.iloc[-1]) / atr, 999.0)
+    if extension_atr > DISCOVERY_MAX_EXTENSION_ATR:
+        return None
+
+    trend = price > ema20.iloc[-1] > ema50.iloc[-1]
+    ema20_slope = _safe_float(ema20.iloc[-1] / ema20.iloc[-6] - 1.0)
+
+    prior_15d_return = _safe_float(close.iloc[-6] / close.iloc[-21] - 1.0)
+    acceleration = ret_5d - (prior_15d_return / 3.0)
+    relative_strength_5d = ret_5d - spy_5d_return
+
+    rs_score = float(np.clip(50 + relative_strength_5d * 500, 0, 100))
+    accel_score = float(np.clip(50 + acceleration * 700, 0, 100))
+    volume_score = float(np.clip(50 + (daily_rvol - 1.0) * 50, 0, 100))
+    trend_score = 100.0 if trend and ema20_slope > 0 else (65.0 if trend else 35.0)
+    extension_score = float(np.clip(100 - abs(extension_atr) * 30, 0, 100))
+
+    score = (
+        rs_score * 0.30
+        + accel_score * 0.25
+        + volume_score * 0.20
+        + trend_score * 0.15
+        + extension_score * 0.10
     )
 
-    stocks = [
-        symbol
-        for symbol, _ in scored[:max_stocks]
-    ]
+    metrics = {
+        "price": price,
+        "ret_5d": ret_5d,
+        "ret_20d": ret_20d,
+        "relative_strength_5d": relative_strength_5d,
+        "acceleration": acceleration,
+        "daily_rvol": daily_rvol,
+        "avg_dollar_volume": avg_dollar_volume,
+        "extension_atr": extension_atr,
+        "ema20_slope": ema20_slope,
+    }
+    return float(score), metrics
+
+
+def discover_opportunities(max_stocks: int = DISCOVERY_TOP_N) -> List[str]:
+    """Scan the broad market, rank candidates, and cache the result."""
+    global DISCOVERY_CACHE
+    cached_symbols, cached_at = DISCOVERY_CACHE
+    now = dt.datetime.now(dt.timezone.utc)
+    if cached_symbols and (now - cached_at).total_seconds() < DISCOVERY_CACHE_TTL_SECONDS:
+        return cached_symbols[:max_stocks]
+
+    universe = get_discovery_universe()
+    if not universe:
+        return list(STOCK_CANDIDATES[:max_stocks])
+
+    benchmark = fetch_daily_bars_batch(["SPY"], DISCOVERY_LOOKBACK_DAYS).get("SPY")
+    spy_5d_return = 0.0
+    if benchmark is not None and len(benchmark) >= 6:
+        spy_5d_return = _safe_float(benchmark["Close"].iloc[-1] / benchmark["Close"].iloc[-6] - 1.0)
+
+    ranked: List[Tuple[str, float, Dict[str, float]]] = []
+    batches = [universe[i:i + DISCOVERY_BATCH_SIZE] for i in range(0, len(universe), DISCOVERY_BATCH_SIZE)]
+    logger.info("[DISCOVERY] Scanning %s symbols in %s batches...", len(universe), len(batches))
+
+    for batch in batches:
+        daily_data = fetch_daily_bars_batch(batch)
+        for symbol, df in daily_data.items():
+            try:
+                scored = _discovery_score(df, spy_5d_return)
+                if scored is not None:
+                    score, metrics = scored
+                    ranked.append((symbol, score, metrics))
+            except Exception as exc:
+                logger.debug("[DISCOVERY] %s scoring failed: %s", symbol, exc)
+
+    ranked.sort(key=lambda item: item[1], reverse=True)
+    selected = [symbol for symbol, _, _ in ranked[:max_stocks]]
+
+    # Fill any empty slots from the original list. These fallback names still
+    # have to pass every existing V12/V12.1 gate before an order is possible.
+    for symbol in STOCK_CANDIDATES:
+        if len(selected) >= max_stocks:
+            break
+        if symbol not in selected:
+            selected.append(symbol)
+
+    DISCOVERY_CACHE = (selected, now)
+
+    logger.info(
+        "[DISCOVERY] %s candidates passed discovery; selected=%s",
+        len(ranked), selected,
+    )
+    for rank, (symbol, score, metrics) in enumerate(ranked[:max_stocks], start=1):
+        logger.info(
+            "[DISCOVERY] #%s %s score=%.1f 5D=%+.2f%% 20D=%+.2f%% "
+            "RS5D=%+.2f%% RVOL=%.2f ext=%.2f avg$vol=$%.0f",
+            rank, symbol, score, metrics["ret_5d"] * 100,
+            metrics["ret_20d"] * 100, metrics["relative_strength_5d"] * 100,
+            metrics["daily_rvol"], metrics["extension_atr"], metrics["avg_dollar_volume"],
+        )
+
+    return selected[:max_stocks]
+
+
+def build_watchlist(max_stocks: int = DISCOVERY_TOP_N) -> List[str]:
+    """Build the execution watchlist from market discovery."""
+    if ENABLE_MARKET_DISCOVERY:
+        stocks = discover_opportunities(max_stocks=max_stocks)
+    else:
+        # Original V12 watchlist behavior retained behind the feature switch.
+        scored: List[Tuple[str, float]] = []
+        for symbol in STOCK_CANDIDATES:
+            try:
+                df = fetch_4h_bars_cached(symbol)
+                if df is None:
+                    continue
+                close = df["Close"]
+                ema20 = ta.trend.ema_indicator(close, window=EMA_FAST_4H)
+                ema50 = ta.trend.ema_indicator(close, window=EMA_SLOW_4H)
+                if pd.isna(ema20.iloc[-1]) or pd.isna(ema50.iloc[-1]):
+                    continue
+                if ema20.iloc[-1] <= ema50.iloc[-1]:
+                    continue
+                atr = calculate_atr(df)
+                if atr <= 0:
+                    continue
+                price = float(close.iloc[-1])
+                extension = (price - ema20.iloc[-1]) / atr
+                if extension > 2.5:
+                    continue
+                scored.append((symbol, -abs(extension) + (1.0 if ema20.iloc[-1] > ema20.iloc[-4] else 0.0)))
+            except Exception as exc:
+                logger.debug("[SCREENER] %s failed: %s", symbol, exc)
+        scored.sort(key=lambda x: x[1], reverse=True)
+        stocks = [symbol for symbol, _ in scored[:max_stocks]]
 
     if ENABLE_CRYPTO_TRADING:
         stocks.extend(CRYPTO_TARGETS)
 
-    logger.info(
-        "[SCREENER] Watchlist: %s",
-        stocks,
-    )
-
+    logger.info("[SCREENER] Execution watchlist: %s", stocks)
     return stocks
 
 
-# ============================================================================
 # 14. ORDER PRICING
 # ============================================================================
 
@@ -1656,6 +1857,7 @@ def run_cycle() -> None:
         "blocked_cooldown": 0,
         "orders_submitted": 0,
         "order_failures": 0,
+        "discovery_candidates": 0,
     }
 
     logger.info(
@@ -1754,9 +1956,10 @@ def run_cycle() -> None:
     # ------------------------------------------------------------------
 
     watchlist = build_watchlist(
-        max_stocks=12
+        max_stocks=DISCOVERY_TOP_N
     )
     diagnostics["watchlist"] = len(watchlist)
+    diagnostics["discovery_candidates"] = len(watchlist)
 
     for symbol in watchlist:
 
@@ -2048,12 +2251,13 @@ def run_cycle() -> None:
             )
 
     logger.info(
-        "=== V12.1 DIAGNOSTIC SUMMARY === "
-        "watchlist=%s scanned=%s no_1m=%s no_4h=%s "
+        "=== V13 DISCOVERY DIAGNOSTIC SUMMARY === "
+        "discovery=%s watchlist=%s scanned=%s no_1m=%s no_4h=%s "
         "quality_reject=%s trend_reject=%s slope_reject=%s "
         "extension_reject=%s score_reject=%s signal_valid=%s "
         "size_zero=%s blocked_position=%s blocked_pending=%s "
         "blocked_cooldown=%s submitted=%s failures=%s",
+        diagnostics["discovery_candidates"],
         diagnostics["watchlist"],
         diagnostics["symbols_scanned"],
         diagnostics["no_1m_data"],
@@ -2086,7 +2290,7 @@ def main() -> None:
     )
 
     logger.info(
-        "Bull. Bear and Broke v12.1 DIAGNOSTIC ONLINE"
+        "Bull. Bear and Broke v13 MARKET DISCOVERY ONLINE"
     )
 
     logger.info(
@@ -2107,6 +2311,13 @@ def main() -> None:
     logger.info(
         "Crypto trading: %s",
         ENABLE_CRYPTO_TRADING,
+    )
+
+    logger.info(
+        "Market discovery: %s | universe cap=%s | top candidates=%s",
+        ENABLE_MARKET_DISCOVERY,
+        DISCOVERY_MAX_UNIVERSE,
+        DISCOVERY_TOP_N,
     )
 
     logger.info(
