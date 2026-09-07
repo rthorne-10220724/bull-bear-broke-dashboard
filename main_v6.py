@@ -1638,6 +1638,26 @@ def cancel_stale_orders(
 
 def run_cycle() -> None:
 
+    # Per-cycle diagnostics. These counters do NOT alter strategy decisions.
+    diagnostics = {
+        "watchlist": 0,
+        "symbols_scanned": 0,
+        "no_1m_data": 0,
+        "no_4h_data": 0,
+        "quality_rejected": 0,
+        "trend_rejected": 0,
+        "slope_rejected": 0,
+        "extension_rejected": 0,
+        "score_rejected": 0,
+        "signal_valid": 0,
+        "size_zero": 0,
+        "blocked_position": 0,
+        "blocked_pending": 0,
+        "blocked_cooldown": 0,
+        "orders_submitted": 0,
+        "order_failures": 0,
+    }
+
     logger.info(
         "========== TRADING CYCLE =========="
     )
@@ -1698,6 +1718,11 @@ def run_cycle() -> None:
 
     cancel_stale_orders(orders)
 
+    # Refresh after cancellation so stale orders cannot consume capacity
+    # for the current cycle.
+    orders = get_open_orders()
+    pending = get_pending_symbols(orders)
+
     active_count = (
         len(positions)
         + len(pending)
@@ -1716,7 +1741,11 @@ def run_cycle() -> None:
 
     if active_count >= MAX_TOTAL_ACTIVE_TRADES:
         logger.info(
-            "Maximum active trade capacity reached."
+            "Maximum active trade capacity reached: "
+            "positions=%s pending=%s limit=%s",
+            len(positions),
+            len(pending),
+            MAX_TOTAL_ACTIVE_TRADES,
         )
         return
 
@@ -1727,10 +1756,12 @@ def run_cycle() -> None:
     watchlist = build_watchlist(
         max_stocks=12
     )
+    diagnostics["watchlist"] = len(watchlist)
 
     for symbol in watchlist:
 
         try:
+            diagnostics["symbols_scanned"] += 1
 
             # Re-fetch state because an earlier symbol may
             # have created a new position/order.
@@ -1751,11 +1782,19 @@ def run_cycle() -> None:
             ):
                 break
 
-            if not symbol_available(
-                symbol,
-                positions,
-                pending,
-            ):
+            if symbol in positions:
+                diagnostics["blocked_position"] += 1
+                logger.info("[%s] blocked: existing position", symbol)
+                continue
+
+            if symbol in pending:
+                diagnostics["blocked_pending"] += 1
+                logger.info("[%s] blocked: pending order", symbol)
+                continue
+
+            if is_on_cooldown(symbol):
+                diagnostics["blocked_cooldown"] += 1
+                logger.info("[%s] blocked: cooldown", symbol)
                 continue
 
             if "/" in symbol:
@@ -1777,6 +1816,7 @@ def run_cycle() -> None:
             )
 
             if df_1m is None:
+                diagnostics["no_1m_data"] += 1
                 logger.info(
                     "[%s] rejected: no 1m data",
                     symbol,
@@ -1788,6 +1828,7 @@ def run_cycle() -> None:
             )
 
             if df_4h is None:
+                diagnostics["no_4h_data"] += 1
                 logger.info(
                     "[%s] rejected: no 4H data",
                     symbol,
@@ -1815,6 +1856,7 @@ def run_cycle() -> None:
             )
 
             if not quality_ok:
+                diagnostics["quality_rejected"] += 1
 
                 logger.info(
                     "[%s] rejected: %s",
@@ -1831,6 +1873,17 @@ def run_cycle() -> None:
             signal = evaluate_signal(
                 indicators
             )
+
+            if not signal.valid:
+                rejection = signal.rejection or "unknown signal rejection"
+                if "4H trend is" in rejection:
+                    diagnostics["trend_rejected"] += 1
+                elif "EMA20 slope" in rejection:
+                    diagnostics["slope_rejected"] += 1
+                elif "extended" in rejection:
+                    diagnostics["extension_rejected"] += 1
+                elif "signal score" in rejection:
+                    diagnostics["score_rejected"] += 1
 
             logger.info(
                 "[%s] price=%.2f "
@@ -1854,7 +1907,7 @@ def run_cycle() -> None:
 
             if not signal.valid:
 
-                logger.debug(
+                logger.info(
                     "[%s] rejected: %s",
                     symbol,
                     signal.rejection,
@@ -1862,25 +1915,73 @@ def run_cycle() -> None:
 
                 continue
 
+            diagnostics["signal_valid"] += 1
+            logger.info(
+                "[%s] SIGNAL PASSED | score=%s | reasons=%s",
+                symbol,
+                signal.score,
+                " | ".join(signal.reasons),
+            )
+
             # ----------------------------------------------------------
             # Final sizing
             # ----------------------------------------------------------
 
+            # Diagnostic sizing breakdown. The actual sizing function/rules
+            # remain unchanged; this only exposes why qty may become zero.
+            price = indicators["price"]
+            atr = indicators["atr"]
+            risk_dollars = equity * RISK_PER_TRADE_PCT
+            stop_distance = ATR_MULTIPLIER_STOP * atr
+            qty_by_risk = (
+                risk_dollars / stop_distance
+                if stop_distance > 0 else 0.0
+            )
+            qty_by_cap = (
+                (equity * MAX_POSITION_PCT) / price
+                if price > 0 else 0.0
+            )
+            qty_by_buying_power = (
+                (buying_power * 0.95) / price
+                if price > 0 else 0.0
+            )
+            raw_qty = min(
+                qty_by_risk,
+                qty_by_cap,
+                qty_by_buying_power,
+            )
             qty = calculate_position_size(
                 equity=equity,
                 buying_power=buying_power,
-                price=indicators["price"],
-                atr=indicators["atr"],
+                price=price,
+                atr=atr,
+            )
+
+            logger.info(
+                "[%s] SIZING | equity=$%.2f risk=$%.2f ATR=%.4f "
+                "stop_dist=%.4f raw_qty=%.4f "
+                "risk_qty=%.4f cap_qty=%.4f bp_qty=%.4f final_qty=%s",
+                symbol,
+                equity,
+                risk_dollars,
+                atr,
+                stop_distance,
+                raw_qty,
+                qty_by_risk,
+                qty_by_cap,
+                qty_by_buying_power,
+                qty,
             )
 
             if qty <= 0:
-
+                diagnostics["size_zero"] += 1
                 logger.info(
-                    "[%s] rejected: "
-                    "position size <= 0",
+                    "[%s] rejected: ZERO-SHARE SIZING | raw_qty=%.4f "
+                    "| limiting_qty=%.4f",
                     symbol,
+                    raw_qty,
+                    min(qty_by_risk, qty_by_cap, qty_by_buying_power),
                 )
-
                 continue
 
             # ----------------------------------------------------------
@@ -1893,11 +1994,19 @@ def run_cycle() -> None:
                 orders
             )
 
-            if not symbol_available(
-                symbol,
-                positions,
-                pending,
-            ):
+            if symbol in positions:
+                diagnostics["blocked_position"] += 1
+                logger.info("[%s] blocked: existing position", symbol)
+                continue
+
+            if symbol in pending:
+                diagnostics["blocked_pending"] += 1
+                logger.info("[%s] blocked: pending order", symbol)
+                continue
+
+            if is_on_cooldown(symbol):
+                diagnostics["blocked_cooldown"] += 1
+                logger.info("[%s] blocked: cooldown", symbol)
                 continue
 
             # ----------------------------------------------------------
@@ -1918,10 +2027,13 @@ def run_cycle() -> None:
             )
 
             if response is not None:
+                diagnostics["orders_submitted"] += 1
                 logger.info(
                     "[%s] order accepted by broker.",
                     symbol,
                 )
+            else:
+                diagnostics["order_failures"] += 1
 
                 # Prevent immediately submitting another
                 # order in the same cycle.
@@ -1934,6 +2046,31 @@ def run_cycle() -> None:
                 symbol,
                 exc,
             )
+
+    logger.info(
+        "=== V12.1 DIAGNOSTIC SUMMARY === "
+        "watchlist=%s scanned=%s no_1m=%s no_4h=%s "
+        "quality_reject=%s trend_reject=%s slope_reject=%s "
+        "extension_reject=%s score_reject=%s signal_valid=%s "
+        "size_zero=%s blocked_position=%s blocked_pending=%s "
+        "blocked_cooldown=%s submitted=%s failures=%s",
+        diagnostics["watchlist"],
+        diagnostics["symbols_scanned"],
+        diagnostics["no_1m_data"],
+        diagnostics["no_4h_data"],
+        diagnostics["quality_rejected"],
+        diagnostics["trend_rejected"],
+        diagnostics["slope_rejected"],
+        diagnostics["extension_rejected"],
+        diagnostics["score_rejected"],
+        diagnostics["signal_valid"],
+        diagnostics["size_zero"],
+        diagnostics["blocked_position"],
+        diagnostics["blocked_pending"],
+        diagnostics["blocked_cooldown"],
+        diagnostics["orders_submitted"],
+        diagnostics["order_failures"],
+    )
 
 
 # ============================================================================
@@ -1949,7 +2086,7 @@ def main() -> None:
     )
 
     logger.info(
-        "Bull. Bear and Broke v12 ONLINE"
+        "Bull. Bear and Broke v12.1 DIAGNOSTIC ONLINE"
     )
 
     logger.info(
