@@ -10,6 +10,8 @@ Responsibilities added here:
 - optionally repair orphaned exits with an OCO order
 - default automatic repair ON in paper trading, OFF in live trading
 - block new entries if any open position remains unprotected
+- count only BUY orders as pending entries (protective SELL orders do not consume slots)
+- use a configurable, realistic 1-minute ATR-percent quality floor
 - preserve the existing main_v6.py signal, sizing, discovery, and entry rules
 
 Recommended Render start command:
@@ -19,7 +21,6 @@ Recommended Render start command:
 from __future__ import annotations
 
 import os
-import sys
 import time
 from typing import Any, Dict, Iterable, List, Set, Tuple
 
@@ -63,6 +64,12 @@ BLOCK_NEW_ENTRIES_IF_UNPROTECTED = (
     == "true"
 )
 
+# The v13 engine used a hard-coded 0.35% minimum 1-minute ATR. For liquid
+# equities that is unusually restrictive and can reject the entire watchlist
+# before signal scoring. Keep a quality floor, but calibrate it to 0.08% by
+# default and make it configurable from Render.
+MIN_1M_ATR_PCT = float(os.getenv("MIN_1M_ATR_PCT", "0.08"))
+
 # ATR-based repair uses the same stop/target multipliers as the entry engine.
 REPAIR_STOP_ATR_MULTIPLIER = engine.ATR_MULTIPLIER_STOP
 REPAIR_TARGET_ATR_MULTIPLIER = engine.ATR_MULTIPLIER_TARGET
@@ -90,6 +97,76 @@ def _iter_order_tree(orders: Iterable[Any]) -> Iterable[Any]:
         legs = getattr(order, "legs", None) or []
         for leg in _iter_order_tree(legs):
             yield leg
+
+
+def get_pending_entry_symbols(orders: List[Any]) -> Set[str]:
+    """
+    Return symbols with open BUY orders only.
+
+    The original engine counted every open order as a pending entry. Once OCO
+    protection was restored, its open SELL order incorrectly consumed a trade
+    slot. Protective SELL stops/targets must never count as pending entries.
+    """
+    symbols: Set[str] = set()
+
+    for order in _iter_order_tree(orders):
+        symbol = str(getattr(order, "symbol", "") or "").upper()
+        side = _enum_text(getattr(order, "side", None))
+
+        if symbol and side == "buy":
+            symbols.add(symbol)
+
+    return symbols
+
+
+def passes_data_quality(
+    df_1m: pd.DataFrame,
+    indicators: Dict[str, Any],
+) -> Tuple[bool, str]:
+    """Calibrated replacement for the engine's hard-coded quality gate."""
+    if len(df_1m) < 60:
+        return False, f"insufficient 1m history ({len(df_1m)} < 60)"
+
+    required_columns = {"Open", "High", "Low", "Close", "Volume"}
+
+    if not required_columns.issubset(df_1m.columns):
+        return False, "missing OHLCV columns"
+
+    if not np.isfinite(
+        df_1m[list(required_columns)].tail(30).to_numpy()
+    ).all():
+        return False, "non-finite market data"
+
+    price = float(indicators.get("price", 0) or 0)
+    atr = float(indicators.get("atr", 0) or 0)
+    rvol = float(indicators.get("rvol", 0) or 0)
+    atr_pct = float(indicators.get("atr_pct", 0) or 0)
+
+    if price <= 0:
+        return False, "invalid price"
+
+    if atr <= 0:
+        return False, "invalid ATR"
+
+    if rvol < engine.MIN_RVOL:
+        return False, (
+            f"insufficient RVOL ({rvol:.2f} < {engine.MIN_RVOL:.2f})"
+        )
+
+    if atr_pct < MIN_1M_ATR_PCT:
+        return False, (
+            f"volatility too low (1m ATR%={atr_pct:.3f} < {MIN_1M_ATR_PCT:.3f})"
+        )
+
+    return True, (
+        f"data/volatility valid (RVOL={rvol:.2f}, 1m ATR%={atr_pct:.3f})"
+    )
+
+
+# Patch only the two engine helpers whose behavior needed correction. The rest
+# of the v13 strategy stays untouched.
+engine.get_pending_symbols = get_pending_entry_symbols
+engine.passes_data_quality = passes_data_quality
 
 
 def _sell_orders_by_symbol(orders: List[Any]) -> Dict[str, List[Any]]:
@@ -209,8 +286,6 @@ def _repair_oco_for_position(position: Any) -> bool:
         )
         return False
 
-    # Alpaca GTC limit/OCO equity orders generally need whole-share qty.
-    # Do not guess how to protect a fractional remainder.
     rounded_qty = round(qty)
     if abs(qty - rounded_qty) > 1e-8:
         engine.logger.error(
@@ -231,7 +306,6 @@ def _repair_oco_for_position(position: Any) -> bool:
     stop_price = round(current_price - (atr * REPAIR_STOP_ATR_MULTIPLIER), 2)
     target_price = round(current_price + (atr * REPAIR_TARGET_ATR_MULTIPLIER), 2)
 
-    # Alpaca requires a valid positive stop and at least $0.01 separation.
     stop_price = max(0.01, min(stop_price, round(current_price - 0.01, 2)))
     target_price = max(round(current_price + 0.01, 2), target_price)
 
@@ -350,10 +424,8 @@ def reconcile_portfolio() -> Tuple[bool, Set[str]]:
             repaired = _repair_oco_for_position(position)
 
             if repaired:
-                # Remove provisionally; we verify broker state after all repairs.
                 unprotected.discard(symbol)
 
-    # Verify repairs using fresh broker state.
     if AUTO_REPAIR_ORPHANED_EXITS:
         time.sleep(REPAIR_SETTLE_SECONDS)
         fresh_orders = engine.get_open_orders()
@@ -392,19 +464,13 @@ def reconcile_portfolio() -> Tuple[bool, Set[str]]:
 def run_supervised_cycle() -> None:
     protected, unprotected = reconcile_portfolio()
 
-    if (
-        BLOCK_NEW_ENTRIES_IF_UNPROTECTED
-        and not protected
-    ):
+    if BLOCK_NEW_ENTRIES_IF_UNPROTECTED and not protected:
         engine.logger.error(
             "NEW ENTRIES BLOCKED: existing position(s) lack complete protection: %s",
             ", ".join(sorted(unprotected)),
         )
         return
 
-    # Existing engine remains the single source of truth for:
-    # market hours, circuit breaker, active capacity, discovery, signal score,
-    # position sizing, cooldowns, duplicate prevention, and order submission.
     engine.run_cycle()
 
 
@@ -422,6 +488,13 @@ def main() -> None:
     engine.logger.info(
         "Block entries if unprotected: %s",
         BLOCK_NEW_ENTRIES_IF_UNPROTECTED,
+    )
+    engine.logger.info(
+        "Pending-entry accounting: BUY orders only",
+    )
+    engine.logger.info(
+        "1m ATR quality floor: %.3f%%",
+        MIN_1M_ATR_PCT,
     )
     engine.logger.info("Cycle seconds: %s", engine.CYCLE_SECONDS)
     engine.logger.info("==========================================")
