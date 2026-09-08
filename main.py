@@ -2,17 +2,16 @@
 BULL. BEAR AND BROKE — MAIN SUPERVISOR
 ======================================
 
-Clean Render entrypoint for the existing trading engine.
+Clean Render entrypoint for the existing v13 trading engine.
 
-Responsibilities added here:
+Fixes/safeguards provided here:
 - reconcile Alpaca positions against open protective orders every cycle
-- identify missing stop-loss / take-profit protection
-- optionally repair orphaned exits with an OCO order
-- default automatic repair ON in paper trading, OFF in live trading
-- block new entries if any open position remains unprotected
-- count only BUY orders as pending entries (protective SELL orders do not consume slots)
-- use a configurable, realistic 1-minute ATR-percent quality floor
-- preserve the existing main_v6.py signal, sizing, discovery, and entry rules
+- repair orphaned exits automatically in PAPER mode by default
+- block new entries while an existing position is unprotected
+- count only BUY orders as pending entries
+- use a configurable 1-minute ATR-percent quality floor
+- fetch enough 1-minute history for the engine's 15-minute MACD calculation
+- preserve the existing main_v6.py discovery, scoring, sizing, and entry logic
 
 Recommended Render start command:
     python main.py
@@ -20,9 +19,10 @@ Recommended Render start command:
 
 from __future__ import annotations
 
+import datetime as dt
 import os
 import time
-from typing import Any, Dict, Iterable, List, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 import numpy as np
 import pandas as pd
@@ -46,8 +46,6 @@ from alpaca.trading.enums import (
 # SUPERVISOR CONFIG
 # ============================================================================
 
-# In PAPER mode, repair orphaned exits by default so the bot can prove the
-# full buy -> protect -> exit lifecycle. In LIVE mode, default to warning only.
 AUTO_REPAIR_ORPHANED_EXITS = (
     os.getenv(
         "AUTO_REPAIR_ORPHANED_EXITS",
@@ -56,7 +54,6 @@ AUTO_REPAIR_ORPHANED_EXITS = (
     == "true"
 )
 
-# Never add new risk while an existing position is missing protection.
 BLOCK_NEW_ENTRIES_IF_UNPROTECTED = (
     os.getenv("BLOCK_NEW_ENTRIES_IF_UNPROTECTED", "true")
     .strip()
@@ -64,49 +61,55 @@ BLOCK_NEW_ENTRIES_IF_UNPROTECTED = (
     == "true"
 )
 
-# The v13 engine used a hard-coded 0.35% minimum 1-minute ATR. For liquid
-# equities that is unusually restrictive and can reject the entire watchlist
-# before signal scoring. Keep a quality floor, but calibrate it to 0.08% by
-# default and make it configurable from Render.
+# The original v13 hard-coded 0.35% minimum 1-minute ATR. That rejected many
+# normal liquid stocks before they ever reached scoring. Keep a floor, but use
+# 0.08% by default and allow Render to override it.
 MIN_1M_ATR_PCT = float(os.getenv("MIN_1M_ATR_PCT", "0.08"))
 
-# ATR-based repair uses the same stop/target multipliers as the entry engine.
+# MACD bug fix:
+# main_v6.py resamples 1-minute closes into 15-minute bars and requires >=40
+# completed 15-minute bars. Its old fetch returned only 180 one-minute bars,
+# which could produce only ~12 15-minute bars. Fetch multiple calendar days so
+# the existing MACD logic can actually run.
+MACD_HISTORY_DAYS = int(os.getenv("MACD_HISTORY_DAYS", "7"))
+MACD_MIN_1M_BARS = int(os.getenv("MACD_MIN_1M_BARS", "900"))
+
 REPAIR_STOP_ATR_MULTIPLIER = engine.ATR_MULTIPLIER_STOP
 REPAIR_TARGET_ATR_MULTIPLIER = engine.ATR_MULTIPLIER_TARGET
-
-# Give broker state a moment to settle after submitting repaired OCO exits.
 REPAIR_SETTLE_SECONDS = 2
 
 
 # ============================================================================
-# ORDER / POSITION HELPERS
+# GENERIC HELPERS
 # ============================================================================
 
 def _enum_text(value: Any) -> str:
-    """Normalize Alpaca enum/string values for logging and comparisons."""
     if value is None:
         return ""
     raw = getattr(value, "value", value)
     return str(raw).strip().lower()
 
 
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        number = float(value)
+        return number if np.isfinite(number) else default
+    except (TypeError, ValueError):
+        return default
+
+
 def _iter_order_tree(orders: Iterable[Any]) -> Iterable[Any]:
-    """Yield parent orders and nested legs returned by nested=True."""
     for order in orders or []:
         yield order
-        legs = getattr(order, "legs", None) or []
-        for leg in _iter_order_tree(legs):
-            yield leg
+        for leg in getattr(order, "legs", None) or []:
+            yield from _iter_order_tree([leg])
 
+
+# ============================================================================
+# FIX 1 — PENDING ENTRIES MUST MEAN BUY ORDERS ONLY
+# ============================================================================
 
 def get_pending_entry_symbols(orders: List[Any]) -> Set[str]:
-    """
-    Return symbols with open BUY orders only.
-
-    The original engine counted every open order as a pending entry. Once OCO
-    protection was restored, its open SELL order incorrectly consumed a trade
-    slot. Protective SELL stops/targets must never count as pending entries.
-    """
     symbols: Set[str] = set()
 
     for order in _iter_order_tree(orders):
@@ -119,11 +122,14 @@ def get_pending_entry_symbols(orders: List[Any]) -> Set[str]:
     return symbols
 
 
+# ============================================================================
+# FIX 2 — CALIBRATED 1-MINUTE DATA QUALITY GATE
+# ============================================================================
+
 def passes_data_quality(
     df_1m: pd.DataFrame,
     indicators: Dict[str, Any],
 ) -> Tuple[bool, str]:
-    """Calibrated replacement for the engine's hard-coded quality gate."""
     if len(df_1m) < 60:
         return False, f"insufficient 1m history ({len(df_1m)} < 60)"
 
@@ -137,10 +143,10 @@ def passes_data_quality(
     ).all():
         return False, "non-finite market data"
 
-    price = float(indicators.get("price", 0) or 0)
-    atr = float(indicators.get("atr", 0) or 0)
-    rvol = float(indicators.get("rvol", 0) or 0)
-    atr_pct = float(indicators.get("atr_pct", 0) or 0)
+    price = _safe_float(indicators.get("price"))
+    atr = _safe_float(indicators.get("atr"))
+    rvol = _safe_float(indicators.get("rvol"))
+    atr_pct = _safe_float(indicators.get("atr_pct"))
 
     if price <= 0:
         return False, "invalid price"
@@ -163,11 +169,91 @@ def passes_data_quality(
     )
 
 
-# Patch only the two engine helpers whose behavior needed correction. The rest
-# of the v13 strategy stays untouched.
+# ============================================================================
+# FIX 3 — ENOUGH 1-MINUTE HISTORY FOR 15-MINUTE MACD
+# ============================================================================
+
+def fetch_1m_bars_with_macd_history(
+    ticker: str,
+    limit: int = 180,
+    retries: int = 3,
+) -> Optional[pd.DataFrame]:
+    """
+    Fetch a multi-day 1-minute history.
+
+    The v13 indicator function already resamples this data to 15-minute closes.
+    Returning >=900 recent 1-minute bars gives it enough completed 15-minute
+    candles to satisfy its >=40-bar MACD requirement while preserving the same
+    RSI/EMA/ATR/RVOL calculations on the most recent data.
+    """
+    end = dt.datetime.now(dt.timezone.utc)
+    start = end - dt.timedelta(days=max(3, MACD_HISTORY_DAYS))
+    is_crypto = "/" in ticker
+
+    for attempt in range(retries):
+        try:
+            if is_crypto:
+                request = engine.CryptoBarsRequest(
+                    symbol_or_symbols=ticker,
+                    timeframe=engine.TimeFrame.Minute,
+                    start=start,
+                    end=end,
+                )
+                response = engine.crypto_data_client.get_crypto_bars(request)
+            else:
+                request = engine.StockBarsRequest(
+                    symbol_or_symbols=ticker,
+                    timeframe=engine.TimeFrame.Minute,
+                    start=start,
+                    end=end,
+                    feed=engine.DataFeed.IEX,
+                )
+                response = engine.stock_data_client.get_stock_bars(request)
+
+            df = response.df
+
+            if isinstance(df.index, pd.MultiIndex):
+                try:
+                    df = df.xs(ticker, level=0)
+                except Exception:
+                    return None
+
+            df = engine.normalize_ohlcv(df)
+
+            if df is None:
+                raise ValueError("Invalid/empty OHLCV data")
+
+            desired = max(limit, MACD_MIN_1M_BARS)
+            df = df.tail(desired)
+
+            # Do not reject here if a thin/new symbol has fewer bars. The
+            # existing quality gate will log the exact reason downstream.
+            return df
+
+        except Exception as exc:
+            engine.logger.warning(
+                "[%s] extended 1m data attempt %s/%s failed: %s",
+                ticker,
+                attempt + 1,
+                retries,
+                exc,
+            )
+
+            if attempt < retries - 1:
+                time.sleep(1.5)
+
+    return None
+
+
+# Apply the targeted patches. main_v6.py remains the strategy source of truth.
 engine.get_pending_symbols = get_pending_entry_symbols
 engine.passes_data_quality = passes_data_quality
+engine.fetch_1m_bars = fetch_1m_bars_with_macd_history
 
+
+# ============================================================================
+# POSITION PROTECTION / RECONCILIATION
+# ============================================================================
 
 def _sell_orders_by_symbol(orders: List[Any]) -> Dict[str, List[Any]]:
     grouped: Dict[str, List[Any]] = {}
@@ -176,21 +262,13 @@ def _sell_orders_by_symbol(orders: List[Any]) -> Dict[str, List[Any]]:
         symbol = str(getattr(order, "symbol", "") or "").upper()
         side = _enum_text(getattr(order, "side", None))
 
-        if not symbol or side != "sell":
-            continue
-
-        grouped.setdefault(symbol, []).append(order)
+        if symbol and side == "sell":
+            grouped.setdefault(symbol, []).append(order)
 
     return grouped
 
 
 def _classify_protection(orders: List[Any]) -> Tuple[bool, bool]:
-    """
-    Return (has_stop, has_target).
-
-    Alpaca may expose an OCO take-profit as the parent and the stop as a child
-    when orders are requested with nested=True.
-    """
     has_stop = False
     has_target = False
 
@@ -199,7 +277,6 @@ def _classify_protection(orders: List[Any]) -> Tuple[bool, bool]:
             getattr(order, "type", None)
             or getattr(order, "order_type", None)
         )
-
         stop_price = getattr(order, "stop_price", None)
         limit_price = getattr(order, "limit_price", None)
 
@@ -211,26 +288,14 @@ def _classify_protection(orders: List[Any]) -> Tuple[bool, bool]:
 
         if (
             limit_price not in (None, "", "0", 0)
-            and order_type not in {"stop_limit"}
+            and order_type != "stop_limit"
         ):
             has_target = True
 
     return has_stop, has_target
 
 
-def _safe_float(value: Any, default: float = 0.0) -> float:
-    try:
-        number = float(value)
-        return number if np.isfinite(number) else default
-    except (TypeError, ValueError):
-        return default
-
-
 def _latest_atr(symbol: str) -> float:
-    """
-    Calculate current 1-minute ATR using the engine's own Alpaca data helper.
-    Returns 0 when data is unavailable.
-    """
     df = engine.fetch_1m_bars(symbol, limit=180)
 
     if df is None or df.empty or len(df) < engine.ATR_WINDOW + 5:
@@ -248,8 +313,7 @@ def _latest_atr(symbol: str) -> float:
             window=engine.ATR_WINDOW,
         ).average_true_range()
 
-        atr = _safe_float(atr_series.iloc[-1])
-        return max(atr, 0.0)
+        return max(_safe_float(atr_series.iloc[-1]), 0.0)
 
     except Exception as exc:
         engine.logger.error("[%s] ATR repair calculation failed: %s", symbol, exc)
@@ -257,15 +321,6 @@ def _latest_atr(symbol: str) -> float:
 
 
 def _repair_oco_for_position(position: Any) -> bool:
-    """
-    Submit a fresh OCO exit for an already-open long stock position.
-
-    Repair prices are anchored to CURRENT market price, not a stale historical
-    target. This guarantees the stop remains below current market and the
-    take-profit above it.
-
-    Automatic repair is intended for PAPER trading by default.
-    """
     symbol = str(getattr(position, "symbol", "") or "").upper()
     qty = _safe_float(getattr(position, "qty", 0))
     current_price = _safe_float(getattr(position, "current_price", 0))
@@ -359,18 +414,7 @@ def _repair_oco_for_position(position: Any) -> bool:
         return False
 
 
-# ============================================================================
-# RECONCILIATION
-# ============================================================================
-
 def reconcile_portfolio() -> Tuple[bool, Set[str]]:
-    """
-    Reconcile positions with protective sell orders.
-
-    Returns:
-        all_protected: True only when every open position has both stop + target.
-        unprotected_symbols: symbols still missing complete protection.
-    """
     positions = engine.get_open_positions()
     orders = engine.get_open_orders()
     sell_orders = _sell_orders_by_symbol(orders)
@@ -385,8 +429,9 @@ def reconcile_portfolio() -> Tuple[bool, Set[str]]:
 
     for symbol, position in positions.items():
         symbol = str(symbol).upper()
-        protective_orders = sell_orders.get(symbol, [])
-        has_stop, has_target = _classify_protection(protective_orders)
+        has_stop, has_target = _classify_protection(
+            sell_orders.get(symbol, [])
+        )
 
         qty = _safe_float(getattr(position, "qty", 0))
         avg_entry = _safe_float(getattr(position, "avg_entry_price", 0))
@@ -420,17 +465,13 @@ def reconcile_portfolio() -> Tuple[bool, Set[str]]:
             "TARGET" if not has_target else "",
         )
 
-        if AUTO_REPAIR_ORPHANED_EXITS:
-            repaired = _repair_oco_for_position(position)
-
-            if repaired:
-                unprotected.discard(symbol)
+        if AUTO_REPAIR_ORPHANED_EXITS and _repair_oco_for_position(position):
+            unprotected.discard(symbol)
 
     if AUTO_REPAIR_ORPHANED_EXITS:
         time.sleep(REPAIR_SETTLE_SECONDS)
         fresh_orders = engine.get_open_orders()
         fresh_sell_orders = _sell_orders_by_symbol(fresh_orders)
-
         final_unprotected: Set[str] = set()
 
         for symbol in positions:
@@ -489,12 +530,12 @@ def main() -> None:
         "Block entries if unprotected: %s",
         BLOCK_NEW_ENTRIES_IF_UNPROTECTED,
     )
+    engine.logger.info("Pending-entry accounting: BUY orders only")
+    engine.logger.info("1m ATR quality floor: %.3f%%", MIN_1M_ATR_PCT)
     engine.logger.info(
-        "Pending-entry accounting: BUY orders only",
-    )
-    engine.logger.info(
-        "1m ATR quality floor: %.3f%%",
-        MIN_1M_ATR_PCT,
+        "MACD history: %s calendar days / up to %s 1m bars",
+        MACD_HISTORY_DAYS,
+        MACD_MIN_1M_BARS,
     )
     engine.logger.info("Cycle seconds: %s", engine.CYCLE_SECONDS)
     engine.logger.info("==========================================")
