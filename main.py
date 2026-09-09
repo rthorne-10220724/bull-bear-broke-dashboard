@@ -33,8 +33,18 @@ import ta
 
 import main_v6 as engine
 
-from alpaca.trading.requests import LimitOrderRequest, TakeProfitRequest, StopLossRequest
-from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
+from alpaca.trading.requests import (
+    GetOrdersRequest,
+    LimitOrderRequest,
+    TakeProfitRequest,
+    StopLossRequest,
+)
+from alpaca.trading.enums import (
+    OrderSide,
+    TimeInForce,
+    OrderClass,
+    QueryOrderStatus,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -69,6 +79,12 @@ BLOCK_NEW_ENTRIES_IF_UNPROTECTED = (
     os.getenv("BLOCK_NEW_ENTRIES_IF_UNPROTECTED", "true").strip().lower() == "true"
 )
 REPAIR_SETTLE_SECONDS = 2
+REPAIR_CANCEL_TIMEOUT_SECONDS = int(
+    os.getenv("REPAIR_CANCEL_TIMEOUT_SECONDS", "15")
+)
+REPAIR_CANCEL_POLL_SECONDS = float(
+    os.getenv("REPAIR_CANCEL_POLL_SECONDS", "0.5")
+)
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -91,6 +107,86 @@ def _iter_order_tree(orders: Iterable[Any]) -> Iterable[Any]:
         yield order
         for leg in getattr(order, "legs", None) or []:
             yield from _iter_order_tree([leg])
+
+
+def _get_open_orders_nested() -> List[Any]:
+    """Fetch open orders with OCO/bracket child legs attached."""
+    request = GetOrdersRequest(
+        status=QueryOrderStatus.OPEN,
+        nested=True,
+    )
+    return list(engine.trading_client.get_orders(filter=request) or [])
+
+
+def _cancelable_sell_roots(order: Any, symbol: str) -> List[Any]:
+    """Find the highest sell nodes, never a filled BUY bracket parent."""
+    node_symbol = str(getattr(order, "symbol", "") or "").upper()
+    node_side = _enum_text(getattr(order, "side", None))
+    if node_symbol == symbol and node_side == "sell":
+        return [order]
+
+    roots: List[Any] = []
+    for leg in getattr(order, "legs", None) or []:
+        roots.extend(_cancelable_sell_roots(leg, symbol))
+    return roots
+
+
+def _open_sell_order_roots(symbol: str) -> List[Any]:
+    """Return cancelable open orders whose trees reserve this position."""
+    roots: List[Any] = []
+    for order in _get_open_orders_nested():
+        roots.extend(_cancelable_sell_roots(order, symbol))
+    return roots
+
+
+def _cancel_existing_exits_and_wait(symbol: str) -> bool:
+    """Release shares held by orphaned exits before creating one OCO group."""
+    roots = _open_sell_order_roots(symbol)
+    if not roots:
+        return True
+
+    cancel_ids = []
+    for order in roots:
+        order_id = getattr(order, "id", None)
+        if order_id is None or order_id in cancel_ids:
+            continue
+        cancel_ids.append(order_id)
+
+    for order_id in cancel_ids:
+        try:
+            engine.trading_client.cancel_order_by_id(order_id)
+            engine.logger.warning(
+                "[%s] canceled orphaned exit before OCO repair | order_id=%s",
+                symbol,
+                order_id,
+            )
+        except Exception as exc:
+            # Cancellation can race an order-state update. The polling check
+            # below is authoritative.
+            engine.logger.warning(
+                "[%s] exit cancel returned an error; verifying state | "
+                "order_id=%s error=%s",
+                symbol,
+                order_id,
+                exc,
+            )
+
+    deadline = time.monotonic() + REPAIR_CANCEL_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        if not _open_sell_order_roots(symbol):
+            return True
+        time.sleep(REPAIR_CANCEL_POLL_SECONDS)
+
+    remaining = [
+        str(getattr(order, "id", "unknown"))
+        for order in _open_sell_order_roots(symbol)
+    ]
+    engine.logger.error(
+        "[%s] OCO repair stopped: existing exits still reserve shares | orders=%s",
+        symbol,
+        ",".join(remaining) or "unknown",
+    )
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -426,6 +522,56 @@ def _repair_oco_for_position(position: Any) -> bool:
     target_price = max(round(current + 0.01, 2), target_price)
 
     try:
+        # A non-nested response can expose the profit target while hiding its
+        # OCO stop sibling. Confirm the complete tree before changing orders.
+        nested = _sell_orders_by_symbol(_get_open_orders_nested())
+        has_stop, has_target = _classify_protection(nested.get(symbol, []))
+        if has_stop and has_target:
+            engine.logger.info(
+                "[%s] OCO repair not needed: nested stop and target confirmed.",
+                symbol,
+            )
+            return True
+
+        # An orphan target reserves every share, so Alpaca will reject another
+        # full-quantity OCO until that reservation has actually been released.
+        if not _cancel_existing_exits_and_wait(symbol):
+            return False
+
+        # Cancel/fill processing is asynchronous. Refresh the position before
+        # sizing the replacement so stale quantity can never create an oversell.
+        fresh_position = engine.get_open_positions().get(symbol)
+        if fresh_position is None:
+            engine.logger.warning(
+                "[%s] OCO repair ended: position no longer exists.", symbol
+            )
+            return True
+
+        fresh_qty = _safe_float(getattr(fresh_position, "qty", 0))
+        fresh_rounded_qty = round(fresh_qty)
+        if fresh_qty <= 0:
+            engine.logger.warning(
+                "[%s] OCO repair ended: position quantity is now zero.", symbol
+            )
+            return True
+        if abs(fresh_qty - fresh_rounded_qty) > 1e-8:
+            engine.logger.error(
+                "[%s] OCO repair stopped after cancel: fractional qty %.8f",
+                symbol,
+                fresh_qty,
+            )
+            return False
+
+        rounded_qty = fresh_rounded_qty
+        refreshed_current = _safe_float(
+            getattr(fresh_position, "current_price", current), current
+        )
+        if refreshed_current > 0:
+            current = refreshed_current
+            stop_price, target_price = calculate_exit_prices_v13_1(current, atr)
+            stop_price = max(0.01, min(stop_price, round(current - 0.01, 2)))
+            target_price = max(round(current + 0.01, 2), target_price)
+
         request = LimitOrderRequest(
             symbol=symbol,
             qty=int(rounded_qty),
@@ -451,7 +597,7 @@ def _repair_oco_for_position(position: Any) -> bool:
 
 def reconcile_portfolio() -> Tuple[bool, Set[str]]:
     positions = engine.get_open_positions()
-    orders = engine.get_open_orders()
+    orders = _get_open_orders_nested()
     sell_orders = _sell_orders_by_symbol(orders)
 
     engine.logger.info("========== PORTFOLIO RECONCILIATION ==========")
@@ -482,7 +628,7 @@ def reconcile_portfolio() -> Tuple[bool, Set[str]]:
 
     if AUTO_REPAIR_ORPHANED_EXITS:
         time.sleep(REPAIR_SETTLE_SECONDS)
-        fresh = _sell_orders_by_symbol(engine.get_open_orders())
+        fresh = _sell_orders_by_symbol(_get_open_orders_nested())
         unprotected = {
             str(symbol).upper()
             for symbol in positions
