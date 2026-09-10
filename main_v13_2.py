@@ -9,6 +9,8 @@ Purpose:
 - Permit one 6th entry only when the setup is materially stronger than normal.
 - Never permit more than 6 new entries in a day.
 - Stop opening new positions after 3 filled stop-loss exits in the same day.
+- After the stop-out pause, continue scanning in diagnostic-only mode so good
+  setups are visible without sending any new broker entry orders.
 - Preserve all V13.1 protections: per-symbol cap, cooldown, fresh re-entry,
   stop-distance floor, risk sizing, portfolio reconciliation and OCO repair.
 
@@ -47,6 +49,13 @@ EXCEPTIONAL_MIN_RVOL = float(os.getenv("EXCEPTIONAL_MIN_RVOL", "1.0"))
 # soft-5 / exceptional-6 / hard-6 through the patched signal evaluator below.
 engine.MAX_NEW_ENTRIES_PER_DAY = HARD_DAILY_ENTRY_CAP
 
+# True only while the post-stop-out research scan is running. This bypasses
+# only the total daily entry cap so we can see what the strategy would find.
+# V13.1 signal quality, per-symbol entry limits, cooldowns, data quality,
+# portfolio checks and sizing still run normally.
+_DIAGNOSTIC_ONLY_MODE = False
+_DIAGNOSTIC_WOULD_ENTRIES = []
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -68,10 +77,11 @@ def _iter_order_tree(orders: Iterable[Any]) -> Iterable[Any]:
 
 def _today_start_utc() -> dt.datetime:
     """Midnight Eastern converted to UTC, matching the user's trading day."""
-    eastern = dt.datetime.now(supervisor.dt.ZoneInfo("America/New_York")) if hasattr(supervisor.dt, "ZoneInfo") else None
-    if eastern is None:
+    try:
         from zoneinfo import ZoneInfo
         eastern = dt.datetime.now(ZoneInfo("America/New_York"))
+    except Exception:
+        eastern = dt.datetime.now(dt.timezone.utc)
     start_et = eastern.replace(hour=0, minute=0, second=0, microsecond=0)
     return start_et.astimezone(dt.timezone.utc)
 
@@ -142,6 +152,12 @@ def evaluate_signal_v13_2(indicators):
     if not result.valid:
         return result
 
+    # Post-stop-out diagnostic mode asks: "Would the underlying V13.1 setup
+    # have qualified right now?" It therefore ignores only the aggregate
+    # daily-entry cap. It does not weaken the actual signal rules.
+    if _DIAGNOSTIC_ONLY_MODE:
+        return result
+
     entries_today = engine.get_daily_entry_count()
 
     if entries_today >= HARD_DAILY_ENTRY_CAP:
@@ -193,6 +209,95 @@ engine.evaluate_signal = evaluate_signal_v13_2
 
 
 # ---------------------------------------------------------------------------
+# Diagnostic-only broker shim
+# ---------------------------------------------------------------------------
+
+_real_place_stock_bracket = engine.place_stock_bracket
+
+
+def diagnostic_place_stock_bracket(*, symbol, qty, price, atr, score, reasons):
+    """Record a would-be entry without sending anything to Alpaca."""
+    record = {
+        "symbol": symbol,
+        "qty": qty,
+        "price": price,
+        "atr": atr,
+        "score": score,
+        "reasons": list(reasons or []),
+    }
+    _DIAGNOSTIC_WOULD_ENTRIES.append(record)
+
+    engine.logger.warning(
+        "[%s] DIAGNOSTIC WOULD ENTER — ORDER BLOCKED | qty=%s price=%.2f "
+        "score=%s reasons=%s",
+        symbol,
+        qty,
+        float(price),
+        score,
+        " | ".join(reasons or []),
+    )
+
+    # Return a harmless sentinel so run_cycle continues normally. No broker
+    # method is called. Its generic 'order accepted' line is reinterpreted by
+    # the explicit diagnostic summary printed immediately after the scan.
+    return object()
+
+
+def run_diagnostic_only_scan() -> None:
+    """Run the real scanner/sizer while replacing only final order submission."""
+    global _DIAGNOSTIC_ONLY_MODE
+
+    _DIAGNOSTIC_WOULD_ENTRIES.clear()
+    _DIAGNOSTIC_ONLY_MODE = True
+
+    original_place = engine.place_stock_bracket
+    original_daily_cap = engine.MAX_NEW_ENTRIES_PER_DAY
+
+    # Ensure run_cycle reaches the scanner even if the hard daily cap has
+    # already been reached. No entry can reach Alpaca because submission is
+    # replaced below.
+    engine.place_stock_bracket = diagnostic_place_stock_bracket
+    engine.MAX_NEW_ENTRIES_PER_DAY = 999999
+
+    engine.logger.warning(
+        "V13.2 DIAGNOSTIC-ONLY SCAN STARTED | new broker entries disabled"
+    )
+
+    try:
+        engine.run_cycle()
+    finally:
+        engine.place_stock_bracket = original_place
+        engine.MAX_NEW_ENTRIES_PER_DAY = original_daily_cap
+        _DIAGNOSTIC_ONLY_MODE = False
+
+    if _DIAGNOSTIC_WOULD_ENTRIES:
+        ranked = sorted(
+            _DIAGNOSTIC_WOULD_ENTRIES,
+            key=lambda x: (x["score"], x["price"]),
+            reverse=True,
+        )
+        best = ranked[0]
+        engine.logger.warning(
+            "V13.2 DIAGNOSTIC SUMMARY | would_enter=%s | best=%s score=%s "
+            "price=%.2f | NO ORDERS SENT",
+            len(ranked),
+            best["symbol"],
+            best["score"],
+            float(best["price"]),
+        )
+    else:
+        engine.logger.warning(
+            "V13.2 DIAGNOSTIC SUMMARY | would_enter=0 | no setup cleared "
+            "the existing V13.1 strategy rules | NO ORDERS SENT"
+        )
+
+    engine.logger.info(
+        "V13.2 diagnostic note: any V13 discovery-summary 'submitted' count "
+        "during diagnostic-only mode means WOULD-ENTER simulations, not broker orders."
+    )
+
+
+# ---------------------------------------------------------------------------
 # Daily stop-out circuit breaker
 # ---------------------------------------------------------------------------
 
@@ -221,13 +326,17 @@ def run_supervised_cycle_v13_2() -> None:
             MAX_DAILY_STOP_OUTS,
         )
 
-        # Reconciliation still runs even when entry creation is paused.
+        # Always protect/manage existing positions first.
         protected, unprotected = supervisor.reconcile_portfolio()
         if not protected:
             engine.logger.error(
                 "V13.2 pause reconciliation found unprotected positions: %s",
                 ", ".join(sorted(unprotected)),
             )
+            return
+
+        # Continue learning without creating new orders.
+        run_diagnostic_only_scan()
         return
 
     _v13_1_run_supervised_cycle()
@@ -254,6 +363,9 @@ def main() -> None:
         "improving MACD + bullish 1m EMA",
         EXCEPTIONAL_MIN_SIGNAL_SCORE,
         EXCEPTIONAL_MIN_RVOL,
+    )
+    engine.logger.info(
+        "Post-stop-out behavior: diagnostic-only scanning ON; broker entries OFF"
     )
     engine.logger.info("==========================================")
 
